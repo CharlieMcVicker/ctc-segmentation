@@ -636,6 +636,48 @@ def test_intrusive_token_parameters():
     assert mask[0] == 0
     assert mask[1] == 0
 
+    # Integer token ID configuration
+    config_int = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=[5, 6],
+    )
+    token_ids_int = _get_intrusive_token_ids(config_int)
+    assert list(token_ids_int) == [5, 6]
+    mask_int = _create_intrusive_mask(config_int)
+    assert mask_int[5] == 1
+    assert mask_int[6] == 1
+    assert mask_int[0] == 0
+
+    # Integer token ID out-of-bounds (upper bound)
+    config_oob_upper = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=[100],
+    )
+    with pytest.raises(ValueError, match="out of range for char_list"):
+        _get_intrusive_token_ids(config_oob_upper)
+    with pytest.raises(ValueError, match="out of range for char_list"):
+        _create_intrusive_mask(config_oob_upper)
+
+    # Integer token ID out-of-bounds (negative)
+    config_oob_neg = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=[-1],
+    )
+    with pytest.raises(ValueError, match="out of range|must be non-negative"):
+        _get_intrusive_token_ids(config_oob_neg)
+
+    # Integer token ID with no char_list (valid positive int passes through in _get_intrusive_token_ids)
+    config_no_charlist = CtcSegmentationParameters(
+        intrusive_tokens=[3, 4],
+    )
+    assert list(_get_intrusive_token_ids(config_no_charlist)) == [3, 4]
+    # Negative int with no char_list raises ValueError
+    config_no_charlist_neg = CtcSegmentationParameters(
+        intrusive_tokens=[-2],
+    )
+    with pytest.raises(ValueError, match="must be non-negative"):
+        _get_intrusive_token_ids(config_no_charlist_neg)
+
     # Validation against char_list: invalid token string
     config_invalid = CtcSegmentationParameters(
         char_list=char_list,
@@ -662,6 +704,8 @@ def test_intrusive_token_parameters():
     assert config3.is_intrusive_token[5] == 1  # 'h'
     assert config3.is_intrusive_token[6] == 1  # "'"
     assert config3.is_intrusive_token[1] == 0  # 'a'
+
+
 
 
 
