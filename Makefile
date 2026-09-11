@@ -1,35 +1,34 @@
 # Makefile for CTC segmentation
-# Ludwig Kürzinger, 2021
+# Original author: Ludwig Kürzinger, 2021
 
-all:
-	cythonize -3 ctc_segmentation/ctc_segmentation_dyn.pyx
-	python setup.py sdist
+.PHONY: all build dist clean test install install-dev upload
+
+PYTHON ?= python
+
+all: build
+
+build:
+	$(PYTHON) setup.py build_ext --inplace
+
+dist:
+	$(PYTHON) setup.py sdist bdist_wheel
+
+test:
+	pytest tests/
 
 clean:
-	rm ctc_segmentation/ctc_segmentation_dyn.c || echo "already clean?"
-	rm -rf build/ dist/ ctc_segmentation.egg-info/ || echo "already clean?"
+	rm -rf build/ dist/ *.egg-info .eggs/
+	rm -rf .pytest_cache/ .coverage htmlcov/
+	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+	find . -type f \( -name "*.so" -o -name "*.pyc" -o -name "*.pyo" \) -delete 2>/dev/null || true
+	rm -f ctc_segmentation/ctc_segmentation_dyn.c
+
+install:
+	pip install .
+
+install-dev:
+	pip install -e ".[test]"
 
 upload:
 	twine upload dist/*
-  
-test:
-	cd tests; python -c "import test_ctc_segmentation as test; test.test_ctc_segmentation()"
-	cd tests; python -c "import test_ctc_segmentation as test; test.test_determine_utterance_segments()"
-	cd tests; python -c "import test_ctc_segmentation as test; test.test_prepare_text()"
-	cd tests; python -c "import test_ctc_segmentation as test; test.test_prepare_tokenized_text()"
-	cd tests; python -c "import test_ctc_segmentation as test; test.test_prepare_token_list()"
-
-
-# To test the various installation methods:
-github:
-	cd /; pip install git+https://github.com/lumaku/ctc-segmentation --user
-	
-pip:
-	cd /; pip install ctc-segmentation --user
-
-local:
-	pip install . --user
-
-rm:
-	cd /; pip uninstall -y ctc-segmentation
 

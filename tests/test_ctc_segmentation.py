@@ -6,6 +6,7 @@
 
 """Test functions for CTC segmentation."""
 import numpy as np
+import pytest
 
 from ctc_segmentation import ctc_segmentation
 from ctc_segmentation import CtcSegmentationParameters
@@ -21,13 +22,49 @@ def test_ctcsegmentationparameters():
     """
     config = CtcSegmentationParameters()
     config = eval(str(config))
-    assert config.index_duration_in_seconds == 0.025
-    config.index_duration = 0.025
-    assert config.index_duration_in_seconds == 0.025
+    assert config.index_duration == 0.025
+    config.index_duration = 0.030
+    assert config.index_duration == 0.030
     # test excluded parameters and update procedure
     config.set(char_list=["a", "»"])
     config.update_excluded_characters()
     assert "»" not in config.excluded_characters
+
+
+def test_legacy_timing_parameters_deprecation():
+    """Test deprecation warnings and backward compatibility for legacy timing parameters."""
+    config = CtcSegmentationParameters()
+
+    # Accessing index_duration_in_seconds emits DeprecationWarning
+    with pytest.deprecated_call():
+        _ = config.index_duration_in_seconds
+
+    # Setting index_duration_in_seconds emits DeprecationWarning
+    with pytest.deprecated_call():
+        config.index_duration_in_seconds = 0.040
+    assert config.index_duration == 0.040
+
+    # Setting subsampling_factor emits DeprecationWarning
+    with pytest.deprecated_call():
+        config.subsampling_factor = 4
+
+    # Accessing subsampling_factor emits DeprecationWarning
+    with pytest.deprecated_call():
+        assert config.subsampling_factor == 4
+
+    # Setting frame_duration_ms emits DeprecationWarning and updates index_duration
+    with pytest.deprecated_call():
+        config.frame_duration_ms = 30
+    assert config.index_duration == (30 * 4) / 1000.0
+
+    # Accessing frame_duration_ms emits DeprecationWarning
+    with pytest.deprecated_call():
+        assert config.frame_duration_ms == 30
+
+    # Test initializing via kwargs with legacy parameters
+    with pytest.deprecated_call():
+        config_legacy = CtcSegmentationParameters(subsampling_factor=2, frame_duration_ms=20)
+    assert config_legacy.index_duration == (20 * 2) / 1000.0
 
 
 def test_ctc_segmentation():

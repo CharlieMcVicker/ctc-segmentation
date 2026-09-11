@@ -18,6 +18,8 @@ https://link.springer.com/chapter/10.1007%2F978-3-030-60276-5_27
 """
 
 import logging
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+import warnings
 import numpy as np
 
 logger = logging.getLogger("ctc_segmentation")
@@ -43,69 +45,133 @@ class CtcSegmentationParameters:
     these settings.
     """
 
-    max_prob = -10000000000.0
-    skip_prob = -10000000000.0
-    min_window_size = 8000
-    max_window_size = 100000
-    index_duration = 0.025
-    score_min_mean_over_L = 30
-    space = "·"
-    blank = 0
-    replace_spaces_with_blanks = False
-    blank_transition_cost_zero = False
-    preamble_transition_cost_zero = True
-    backtrack_from_max_t = False
-    self_transition = "ε"
-    start_of_ground_truth = "#"
-    excluded_characters = ".,»«•❍·"
-    tokenized_meta_symbol = "▁"
-    char_list = None
-    syncopy_penalty = 0.25
-    optional_vowel_tokens = None
-    is_optional_vowel = None
-    # legacy Parameters (will be ignored in future versions)
-    subsampling_factor = None
-    frame_duration_ms = None
+    max_prob: float = -10000000000.0
+    skip_prob: float = -10000000000.0
+    min_window_size: int = 8000
+    max_window_size: int = 100000
+    index_duration: float = 0.025
+    score_min_mean_over_L: int = 30
+    space: str = "·"
+    blank: int = 0
+    replace_spaces_with_blanks: bool = False
+    blank_transition_cost_zero: bool = False
+    preamble_transition_cost_zero: bool = True
+    backtrack_from_max_t: bool = False
+    self_transition: str = "ε"
+    start_of_ground_truth: str = "#"
+    excluded_characters: str = ".,»«•❍·"
+    tokenized_meta_symbol: str = "▁"
+    char_list: Optional[Union[List[str], Tuple[str, ...], Set[str], Sequence[str]]] = None
+    syncopy_penalty: float = 0.25
+    optional_vowel_tokens: Optional[Sequence[Union[str, int]]] = None
+    is_optional_vowel: Optional[np.ndarray] = None
+    # legacy Parameters (deprecated, use index_duration instead)
+    _subsampling_factor: Optional[Union[int, float]] = None
+    _frame_duration_ms: Optional[Union[int, float]] = None
 
     @property
-    def index_duration_in_seconds(self):
+    def subsampling_factor(self) -> Optional[Union[int, float]]:
+        """Legacy parameter.
+
+        .. deprecated::
+            Use `index_duration` instead.
+        """
+        warnings.warn(
+            "subsampling_factor is deprecated and will be removed in a future version. "
+            "Use index_duration instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self._subsampling_factor
+
+    @subsampling_factor.setter
+    def subsampling_factor(self, value: Optional[Union[int, float]]) -> None:
+        warnings.warn(
+            "subsampling_factor is deprecated and will be removed in a future version. "
+            "Use index_duration instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self._subsampling_factor = value
+        if self._subsampling_factor is not None and self._frame_duration_ms is not None:
+            self.index_duration = self._frame_duration_ms * self._subsampling_factor / 1000.0
+
+    @property
+    def frame_duration_ms(self) -> Optional[Union[int, float]]:
+        """Legacy parameter.
+
+        .. deprecated::
+            Use `index_duration` instead.
+        """
+        warnings.warn(
+            "frame_duration_ms is deprecated and will be removed in a future version. "
+            "Use index_duration instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self._frame_duration_ms
+
+    @frame_duration_ms.setter
+    def frame_duration_ms(self, value: Optional[Union[int, float]]) -> None:
+        warnings.warn(
+            "frame_duration_ms is deprecated and will be removed in a future version. "
+            "Use index_duration instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self._frame_duration_ms = value
+        if self._subsampling_factor is not None and self._frame_duration_ms is not None:
+            self.index_duration = self._frame_duration_ms * self._subsampling_factor / 1000.0
+
+    @property
+    def index_duration_in_seconds(self) -> float:
         """Derive index duration from frame duration and subsampling.
 
-        This value can be fixed by setting ctc_index_duration, which causes
-        frame_duration_ms and subsampling_factor to be ignored.
-
-        Legacy function. This function will be removed in later versions
+        Legacy property. This property will be removed in later versions
         and replaced by index_duration.
         """
-        if self.subsampling_factor and self.frame_duration_ms:
-            t = self.frame_duration_ms * self.subsampling_factor / 1000
-        else:
-            t = self.index_duration
-        return t
+        warnings.warn(
+            "index_duration_in_seconds is deprecated and will be removed in a future version. "
+            "Use index_duration instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.index_duration
+
+    @index_duration_in_seconds.setter
+    def index_duration_in_seconds(self, value: float) -> None:
+        warnings.warn(
+            "index_duration_in_seconds is deprecated and will be removed in a future version. "
+            "Use index_duration instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.index_duration = value
 
     @property
-    def flags(self):
+    def flags(self) -> int:
         """Get configuration flags to pass to the table_fill operation."""
         flags = int(self.blank_transition_cost_zero)
         flags += 2 * int(self.preamble_transition_cost_zero)
         return flags
 
-    def update_excluded_characters(self):
+    def update_excluded_characters(self) -> None:
         """Remove known tokens from the list of excluded characters."""
-        self.excluded_characters = "".join(
-            [
-                char
-                for char in self.excluded_characters
-                if True not in [char == j for j in self.char_list]
-            ]
-        )
+        if self.char_list is not None:
+            self.excluded_characters = "".join(
+                [
+                    char
+                    for char in self.excluded_characters
+                    if char not in self.char_list
+                ]
+            )
         logger.debug(f"Excluded characters: {self.excluded_characters}")
 
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs: Any) -> None:
         """Set all parameters as attribute at init."""
         self.set(**kwargs)
 
-    def set(self, **kwargs):
+    def set(self, **kwargs: Any) -> None:
         """Update CtcSegmentationParameters.
 
         Args:
@@ -120,17 +186,23 @@ class CtcSegmentationParameters:
             ):
                 setattr(self, key, kwargs[key])
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         """Print all attribute as dictionary."""
         output = "CtcSegmentationParameters( "
-        for attribute in self.__dict__.keys():
-            value = self.__dict__[attribute]
+        for attribute, value in self.__dict__.items():
+            if attribute.startswith("_"):
+                continue
             output += f"{attribute}={value}, "
         output += ")"
         return output
 
 
-def ctc_segmentation(config, lpz, ground_truth, is_optional_vowel=None):
+def ctc_segmentation(
+    config: CtcSegmentationParameters,
+    lpz: np.ndarray,
+    ground_truth: np.ndarray,
+    is_optional_vowel: Optional[Union[np.ndarray, Sequence[int]]] = None,
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """Extract character-level utterance alignments.
 
     :param config: an instance of CtcSegmentationParameters
@@ -141,7 +213,7 @@ def ctc_segmentation(config, lpz, ground_truth, is_optional_vowel=None):
     """
     blank = config.blank
     offset = 0
-    audio_duration = lpz.shape[0] * config.index_duration_in_seconds
+    audio_duration = lpz.shape[0] * config.index_duration
     logger.info(
         f"CTC segmentation of {len(ground_truth)} chars "
         f"to {audio_duration:.2f}s audio "
@@ -274,7 +346,7 @@ def ctc_segmentation(config, lpz, ground_truth, is_optional_vowel=None):
                 ):
                     # Apply reverse vowel skip transition
                     if c > 0:
-                        timings[c] = (offsets[c] + t) * config.index_duration_in_seconds
+                        timings[c] = (offsets[c] + t) * config.index_duration
                         char_probs[offsets[c] + t] = lpz[
                             t + offsets[c], ground_truth[c, best_vowel_s]
                         ]
@@ -290,7 +362,7 @@ def ctc_segmentation(config, lpz, ground_truth, is_optional_vowel=None):
                         for s in range(0, min_s + 1):
                             timings[c - s] = (
                                 offsets[c] + t
-                            ) * config.index_duration_in_seconds
+                            ) * config.index_duration
                         char_probs[offsets[c] + t] = max_lpz_prob
                         char_index = ground_truth[c, min_s]
                         state_list[offsets[c] + t] = config.char_list[char_index]
@@ -319,7 +391,11 @@ def ctc_segmentation(config, lpz, ground_truth, is_optional_vowel=None):
     return timings, char_probs, state_list
 
 
-def _create_optional_vowel_mask(config, ground_truth, is_token_ids=False):
+def _create_optional_vowel_mask(
+    config: CtcSegmentationParameters,
+    ground_truth: Union[Sequence[Any], np.ndarray],
+    is_token_ids: bool = False,
+) -> np.ndarray:
     """Create a 1D int8 mask indicating optional vowel positions in ground_truth."""
     mask = np.zeros(len(ground_truth), dtype=np.int8)
     if config.optional_vowel_tokens is None:
@@ -348,7 +424,11 @@ def _create_optional_vowel_mask(config, ground_truth, is_token_ids=False):
     return mask
 
 
-def prepare_text(config, text, char_list=None):
+def prepare_text(
+    config: CtcSegmentationParameters,
+    text: Sequence[str],
+    char_list: Optional[Union[List[str], Sequence[str]]] = None,
+) -> Tuple[np.ndarray, List[int]]:
     """Prepare the given text for CTC segmentation.
 
     Creates a matrix of character symbols to represent the given text,
@@ -361,7 +441,7 @@ def prepare_text(config, text, char_list=None):
     :return: label matrix, character index matrix
     """
     # temporary compatibility fix for previous espnet versions
-    if type(config.blank) == str:
+    if isinstance(config.blank, str):
         config.blank = 0
     if char_list is not None:
         config.char_list = char_list
@@ -404,7 +484,10 @@ def prepare_text(config, text, char_list=None):
     return ground_truth_mat, utt_begin_indices
 
 
-def prepare_tokenized_text(config, text):
+def prepare_tokenized_text(
+    config: CtcSegmentationParameters,
+    text: Sequence[str],
+) -> Tuple[np.ndarray, List[int]]:
     """Prepare the given tokenized text for CTC segmentation.
 
     :param config: an instance of CtcSegmentationParameters
@@ -415,21 +498,21 @@ def prepare_tokenized_text(config, text):
     utt_begin_indices = []
     for utt in text:
         # One space in-between
-        if not ground_truth[-1] == config.space:
-            ground_truth += [config.space]
+        if ground_truth[-1] != config.space:
+            ground_truth.append(config.space)
         # Start new utterance remember index
         utt_begin_indices.append(len(ground_truth) - 1)
         # Add tokens of utterance
         for token in utt.split():
             if token in config.char_list:
-                if config.replace_spaces_with_blanks and not token.beginswith(
+                if config.replace_spaces_with_blanks and not token.startswith(
                     config.tokenized_meta_symbol
                 ):
-                    ground_truth += [config.space]
-                ground_truth += [token]
+                    ground_truth.append(config.space)
+                ground_truth.append(token)
     # Add space to the end
-    if not ground_truth[-1] == config.space:
-        ground_truth += [config.space]
+    if ground_truth[-1] != config.space:
+        ground_truth.append(config.space)
     logger.debug(f"ground_truth: {ground_truth}")
     utt_begin_indices.append(len(ground_truth) - 1)
     # Create matrix: time frame x number of letters the character symbol spans
@@ -447,7 +530,10 @@ def prepare_tokenized_text(config, text):
     return ground_truth_mat, utt_begin_indices
 
 
-def prepare_token_list(config, text):
+def prepare_token_list(
+    config: CtcSegmentationParameters,
+    text: Sequence[np.ndarray],
+) -> Tuple[np.ndarray, List[int]]:
     """Prepare the given token list for CTC segmentation.
 
     This function expects the text input in form of a list
@@ -463,15 +549,15 @@ def prepare_token_list(config, text):
         # It's not possible to detect spaces when sequence is
         # already tokenized, so we skip replace_spaces_with_blanks
         # Insert blanks between utterances
-        if not ground_truth[-1] == config.blank:
-            ground_truth += [config.blank]
+        if ground_truth[-1] != config.blank:
+            ground_truth.append(config.blank)
         # Start-of-new-utterance remember index
         utt_begin_indices.append(len(ground_truth) - 1)
         # Append tokens to list
-        ground_truth += utt.tolist()
+        ground_truth.extend(utt.tolist())
     # Add a blank to the end
-    if not ground_truth[-1] == config.blank:
-        ground_truth += [config.blank]
+    if ground_truth[-1] != config.blank:
+        ground_truth.append(config.blank)
     logger.debug(f"ground_truth: {ground_truth}")
     utt_begin_indices.append(len(ground_truth) - 1)
     # Create matrix: time frame x number of letters the character symbol spans
@@ -482,7 +568,13 @@ def prepare_token_list(config, text):
     return ground_truth_mat, utt_begin_indices
 
 
-def determine_utterance_segments(config, utt_begin_indices, char_probs, timings, text):
+def determine_utterance_segments(
+    config: CtcSegmentationParameters,
+    utt_begin_indices: Sequence[int],
+    char_probs: np.ndarray,
+    timings: np.ndarray,
+    text: Sequence[Any],
+) -> List[Tuple[float, float, float]]:
     """Utterance-wise alignments from char-wise alignments.
 
     :param config: an instance of CtcSegmentationParameters
@@ -493,7 +585,7 @@ def determine_utterance_segments(config, utt_begin_indices, char_probs, timings,
     :return: segments, a list of: utterance start and end [s], and its confidence score
     """
 
-    def compute_time(index, align_type):
+    def compute_time(index: int, align_type: str) -> float:
         """Compute start and end time of utterance.
 
         :param index:  frame index value
@@ -505,14 +597,15 @@ def determine_utterance_segments(config, utt_begin_indices, char_probs, timings,
             return max(timings[index + 1] - 0.5, middle)
         elif align_type == "end":
             return min(timings[index - 1] + 0.5, middle)
+        return middle
 
     segments = []
     min_prob = np.float64(-10000000000.0)
     for i in range(len(text)):
         start = compute_time(utt_begin_indices[i], "begin")
         end = compute_time(utt_begin_indices[i + 1], "end")
-        start_t = int(round(start / config.index_duration_in_seconds))
-        end_t = int(round(end / config.index_duration_in_seconds))
+        start_t = int(round(start / config.index_duration))
+        end_t = int(round(end / config.index_duration))
         # Compute confidence score by using the min mean probability
         #   after splitting into segments of L frames
         n = config.score_min_mean_over_L
