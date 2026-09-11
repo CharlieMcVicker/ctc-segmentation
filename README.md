@@ -158,6 +158,32 @@ segments = ctc_segmentation.determine_utterance_segments(config, utt_begin_indic
 
 </div></details>
 
+<details><summary>Intrusive token alignment example (aspiration, glottal stops, phonetic insertion)</summary><div>
+
+To align text when speakers insert unwritten surface sounds (e.g. pre-/post-aspiration `h`, glottal stop `'`, epenthetic consonants) absent from citation transcripts:
+
+```python
+import numpy as np
+import ctc_segmentation
+
+# Configure parameters with candidate intrusive tokens and penalty
+char_list = ["•", "a", "k", "e", "y", "h", "'"]
+config = ctc_segmentation.CtcSegmentationParameters(
+    char_list=char_list,
+    intrusive_tokens=["h", "'"],  # intrusive tokens permitted between ground-truth states
+    intrusive_penalty=0.5,        # log-space penalty subtracted from intrusive detour transitions
+)
+
+# Prepare ground truth and run alignment
+# If citation 'akeya' is spoken as surface 'akeyha', the trellis takes a single-slot detour through 'h'
+text = ["akeya"]
+ground_truth_mat, utt_begin_indices = ctc_segmentation.prepare_text(config, text)
+timings, char_probs, state_list = ctc_segmentation.ctc_segmentation(config, probs, ground_truth_mat)
+segments = ctc_segmentation.determine_utterance_segments(config, utt_begin_indices, char_probs, timings, text)
+```
+
+</div></details>
+
 
 
 # Installation
@@ -192,10 +218,20 @@ To account for preambles or unrelated segments in audio files, the transition co
 
 For languages with phonetic reductions or token syncope (e.g. Cherokee medial vowel syncope, unstressed sound deletion), sounds written in canonical text are often dropped in natural speech. Standard CTC segmentation forces alignment of every character, causing misalignments or requiring intractable $O(2^n)$ string expansions.
 
-To support syncope in $O(T \times S)$ polynomial time, the trellis evaluates an optional 4th transition:
+To support syncope in $O(T \times S)$ polynomial time, the trellis evaluates an optional transition:
 * **Syncope-Skip ($\epsilon$-transition)**: If an intervening character state is marked as an optional syncope token (via `syncope_tokens` or `is_syncope_token`), the dynamic programming trellis can jump directly from the preceding state $c_{\text{prev}}$ to the next character state $c$:
   $$\text{syncope\_skip\_prob} = \text{table}[t-1, c_{\text{prev}}] - \lambda_{\text{syncope}}$$
   where $\lambda_{\text{syncope}} \ge 0$ is a configurable penalty (parameter `syncope_penalty`, default: `0.25`).
+
+#### Intrusive Token Transitions (Single-Slot Detours)
+
+In many languages and dialects, speakers pronounce intrusive sounds (e.g. pre-/post-aspiration `/h/`, glottal stop `/'/`, or epenthetic consonants) that are absent from canonical citation transcripts. Standard CTC segmentation trellises only permit transitions among characters present in the transcript, forcing acoustic evidence for intrusive phonemes into adjacent consonants or blanks.
+
+To capture intrusive sounds dynamically in $O(T \times S \times |J_{\text{intrusive}}|)$ time:
+* **Single-Slot Intrusive Detour**: Between ground-truth character states $c-1$ and $c$, the dynamic programming trellis allows taking a 1-frame detour through candidate intrusive token $j \in J$:
+  $$P_{\text{intrusive}}(t, c, j) = \text{table}[t - 2 + \text{offset}, c - 1] + \text{lpz}[t - 1, j] - \lambda_{\text{intrusive}} + \text{lpz}[t, L(c)]$$
+  where $\lambda_{\text{intrusive}} \ge 0$ is a configurable penalty (parameter `intrusive_penalty`, default: `0.5`).
+* **Single-Slot Mutual Exclusivity**: Between any two ground-truth states, at most one intrusion is permitted, preventing ungrammatical stacking while cleanly reconstructing surface phonetic realisations.
 
 ### 2. Backtracking
 
@@ -204,6 +240,8 @@ Starting from the time step with the highest probability for the last character,
 ![Backward path](doc/2_backtracking.png)
 
 When a syncope-skip transition was selected, backtracking recovers the jump across the omitted token, assigns `0.0s` duration to the skipped token, and does not consume audio frames for it.
+
+When an intrusive detour transition was selected, backtracking records the intrusive token $j^*$ at frame $t-1$ and the ground-truth token $L(c)$ at frame $t$, seamlessly reconstructing the surface phonetic sequence without requiring heuristic post-processing regexes.
 
 ### 3. Confidence score
 
@@ -239,6 +277,12 @@ There are several notable parameters to adjust the working of the algorithm that
 * `syncope_tokens` (default: `None`): List of character strings or token IDs (e.g. `["a", "e", "i", "o", "u", "v"]`) that can be optionally skipped in speech. When set, `prepare_text`, `prepare_token_list`, and `prepare_tokenized_text` automatically build the `is_syncope_token` mask. (Legacy alias: `optional_vowel_tokens`).
 * `syncope_penalty` (default: `0.25`): Penalty in log space ($\lambda_{\text{syncope}}$) applied when taking a syncope-skip transition. Prevents over-eager skipping when acoustic evidence for the token exists. (Legacy alias: `syncopy_penalty`).
 * `is_syncope_token` (default: `None`): 1D `int8` mask array across the interleaved state sequence marking optional syncope token positions. Can be explicitly passed or generated automatically. (Legacy alias: `is_optional_vowel`).
+
+### Intrusive token parameters
+
+* `intrusive_tokens` (default: `None`): List of character strings or token IDs (e.g. `["h", "'"]`) eligible for intrusive detour insertion between ground-truth states when supported by acoustic evidence.
+* `intrusive_penalty` (default: `0.5`): Penalty in log space ($\lambda_{\text{intrusive}}$) subtracted from intrusive detour transitions. Higher values require stronger acoustic confidence to trigger insertion.
+* `is_intrusive_token` (default: `None`): 1D `int8` mask array of size `len(char_list)` marking eligible intrusive tokens in the vocabulary. Can be passed directly or auto-generated from `intrusive_tokens` and `char_list`.
 
 ### Time stamp parameters
 
