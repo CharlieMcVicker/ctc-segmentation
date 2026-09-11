@@ -21,6 +21,8 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                       np.ndarray[np.float32_t, ndim=2] lpz,
                       np.ndarray[np.int64_t, ndim=2] ground_truth,
                       np.ndarray[np.int64_t, ndim=1] offsets,
+                      np.ndarray[np.int8_t, ndim=1] is_syncope_token,
+                      float syncope_penalty,
                       int blank,
                       int flags):
     """Fill the table of transition probabilities.
@@ -29,6 +31,8 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
     :param lpz: character probabilities of each time frame
     :param ground_truth: label sequence
     :param offsets: window offsets per character (given as array of zeros)
+    :param is_syncope_token: 1D mask array marking optional syncope token positions
+    :param syncope_penalty: penalty subtracted for syncope skip transition
     :param blank: label ID of the blank symbol, usually 0
     :param flags: configuration options, default 0
     :return:
@@ -40,14 +44,14 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
     cdef int offset_sum = 0
     cdef int lower_offset
     cdef int higher_offset
-    cdef float switch_prob, stay_prob, skip_prob
+    cdef float switch_prob, stay_prob, skip_prob, syncope_skip_prob
     cdef float prob_max = -1000000000
     cdef float last_max
     cdef int last_arg_max
     cdef np.ndarray[np.int64_t, ndim=1] cur_offset = np.zeros([ground_truth.shape[1]], np.int64) - 1
     cdef float max_lpz_prob
-    cdef float p
-    cdef int s
+    cdef float p, v_prob
+    cdef int s, c_prev, delta_offset, t_prev
     cdef int stay_transition_cost_zero
     cdef int preamble_transition_cost_zero
 
@@ -90,6 +94,31 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                         p = table[t - 1 + cur_offset[s], c - (s + 1)] + lpz[t + offset_sum, ground_truth[c, s]]
                     switch_prob = max(switch_prob, p)
                     max_lpz_prob = max(max_lpz_prob, lpz[t + offset_sum, ground_truth[c, s]])
+
+            # Compute syncope skip probability
+            syncope_skip_prob = prob_max
+            if c >= 2:
+                for s in range(ground_truth.shape[1]):
+                    if ground_truth[c, s] != -1:
+                        # If c - 1 is a syncope token, jump from c - 2 (or c - 3)
+                        if is_syncope_token[c - 1] == 1:
+                            for c_prev in range(max(0, c - 3), c - 1):
+                                delta_offset = offset_sum - offsets[c_prev]
+                                t_prev = t - 1 + delta_offset
+                                if 0 <= t_prev < table.shape[0]:
+                                    v_prob = table[t_prev, c_prev] + lpz[t + offset_sum, ground_truth[c, s]] - syncope_penalty
+                                    if v_prob > syncope_skip_prob:
+                                        syncope_skip_prob = v_prob
+                        # If c - 2 is a syncope token and c - 1 is a blank/space, jump from c - 3 (or c - 4)
+                        elif c >= 3 and is_syncope_token[c - 2] == 1 and (ground_truth[c - 1, 0] == blank or ground_truth[c - 1, 0] == -1):
+                            for c_prev in range(max(0, c - 4), c - 2):
+                                delta_offset = offset_sum - offsets[c_prev]
+                                t_prev = t - 1 + delta_offset
+                                if 0 <= t_prev < table.shape[0]:
+                                    v_prob = table[t_prev, c_prev] + lpz[t + offset_sum, ground_truth[c, s]] - syncope_penalty
+                                    if v_prob > syncope_skip_prob:
+                                        syncope_skip_prob = v_prob
+
             # Compute stay probability
             if t - 1 < 0:
                 stay_prob = prob_max
@@ -99,8 +128,8 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                 stay_prob = table[t - 1, c]
             else:
                 stay_prob = table[t - 1, c] + max(lpz[t + offset_sum, blank], max_lpz_prob)
-            # Use max of stay and switch prob
-            table[t, c] = max(switch_prob, stay_prob)
+            # Use max of stay, switch, and syncope skip prob
+            table[t, c] = max(max(switch_prob, stay_prob), syncope_skip_prob)
             # Remember the row with the max prob
             if last_arg_max == -1 or last_max < table[t, c]:
                 last_max = table[t, c]

@@ -132,6 +132,32 @@ print(get_word_timestamps(audio))
 
 </div></details>
 
+<details><summary>Syncope-aware alignment example (syncope / phonetic reduction / token dropping)</summary><div>
+
+To align text containing optional syncopated tokens (e.g. Cherokee medial vowel syncope, consonant cluster reduction) without combinatorial string expansion:
+
+```python
+import numpy as np
+import ctc_segmentation
+
+# Configure parameters with optional syncope tokens and penalty
+char_list = ["•", "a", "e", "i", "o", "u", "v", "ts", "l", "g"]
+config = ctc_segmentation.CtcSegmentationParameters(
+    char_list=char_list,
+    syncope_tokens=["a", "e", "i", "o", "u", "v"],  # tokens that can be skipped via syncope
+    syncope_penalty=0.25,                           # log-space skip penalty
+)
+
+# Prepare ground truth and run alignment
+# If 'a' in 'tsalagi' is omitted in speech ('tsalgi'), the trellis jumps the syncope token state
+text = ["tsalagi"]
+ground_truth_mat, utt_begin_indices = ctc_segmentation.prepare_text(config, text)
+timings, char_probs, state_list = ctc_segmentation.ctc_segmentation(config, probs, ground_truth_mat)
+segments = ctc_segmentation.determine_utterance_segments(config, utt_begin_indices, char_probs, timings, text)
+```
+
+</div></details>
+
 
 
 # Installation
@@ -162,11 +188,22 @@ To account for preambles or unrelated segments in audio files, the transition co
 
 ![Forward trellis](doc/1_forward.png)
 
+#### Syncope-Aware Trellis ($\epsilon$-Skip Transitions)
+
+For languages with phonetic reductions or token syncope (e.g. Cherokee medial vowel syncope, unstressed sound deletion), sounds written in canonical text are often dropped in natural speech. Standard CTC segmentation forces alignment of every character, causing misalignments or requiring intractable $O(2^n)$ string expansions.
+
+To support syncope in $O(T \times S)$ polynomial time, the trellis evaluates an optional 4th transition:
+* **Syncope-Skip ($\epsilon$-transition)**: If an intervening character state is marked as an optional syncope token (via `syncope_tokens` or `is_syncope_token`), the dynamic programming trellis can jump directly from the preceding state $c_{\text{prev}}$ to the next character state $c$:
+  $$\text{syncope\_skip\_prob} = \text{table}[t-1, c_{\text{prev}}] - \lambda_{\text{syncope}}$$
+  where $\lambda_{\text{syncope}} \ge 0$ is a configurable penalty (parameter `syncope_penalty`, default: `0.25`).
+
 ### 2. Backtracking
 
 Starting from the time step with the highest probability for the last character, backtracking determines the most probable path of characters through all time steps.
 
 ![Backward path](doc/2_backtracking.png)
+
+When a syncope-skip transition was selected, backtracking recovers the jump across the omitted token, assigns `0.0s` duration to the skipped token, and does not consume audio frames for it.
 
 ### 3. Confidence score
 
@@ -175,7 +212,7 @@ For example, if a word within an utterance is missing, this value is low.
 
 ![Confidence score](doc/3_scoring.png)
 
-The confidence score helps to detect and filter-out bad utterances.
+The confidence score helps to detect and filter-out bad utterances. For syncopated utterances, confidence is calculated over realized (spoken) frames, ensuring natural syncope does not artificially degrade utterance confidence.
 
 
 # Parameters
@@ -196,6 +233,12 @@ There are several notable parameters to adjust the working of the algorithm that
 * `min_window_size`: Minimum window size considered for a single utterance. The current default value should be OK in most cases.
 
 * To align utterances with longer unkown audio sections between them, use `blank_transition_cost_zero` (default: False). With this option, the stay transition in the blank state is free. A transition to the next character is only consumed if the probability to switch is higher. In this way, more time steps can be skipped between utterances. Caution: in combination with `replace_spaces_with_blanks == True`, this may lead to misaligned segments.
+
+### Syncope & optional token parameters
+
+* `syncope_tokens` (default: `None`): List of character strings or token IDs (e.g. `["a", "e", "i", "o", "u", "v"]`) that can be optionally skipped in speech. When set, `prepare_text`, `prepare_token_list`, and `prepare_tokenized_text` automatically build the `is_syncope_token` mask. (Legacy alias: `optional_vowel_tokens`).
+* `syncope_penalty` (default: `0.25`): Penalty in log space ($\lambda_{\text{syncope}}$) applied when taking a syncope-skip transition. Prevents over-eager skipping when acoustic evidence for the token exists. (Legacy alias: `syncopy_penalty`).
+* `is_syncope_token` (default: `None`): 1D `int8` mask array across the interleaved state sequence marking optional syncope token positions. Can be explicitly passed or generated automatically. (Legacy alias: `is_optional_vowel`).
 
 ### Time stamp parameters
 

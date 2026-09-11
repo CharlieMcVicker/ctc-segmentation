@@ -6,6 +6,7 @@
 
 """Test functions for CTC segmentation."""
 import numpy as np
+import pytest
 
 from ctc_segmentation import ctc_segmentation
 from ctc_segmentation import CtcSegmentationParameters
@@ -21,13 +22,49 @@ def test_ctcsegmentationparameters():
     """
     config = CtcSegmentationParameters()
     config = eval(str(config))
-    assert config.index_duration_in_seconds == 0.025
-    config.index_duration = 0.025
-    assert config.index_duration_in_seconds == 0.025
+    assert config.index_duration == 0.025
+    config.index_duration = 0.030
+    assert config.index_duration == 0.030
     # test excluded parameters and update procedure
     config.set(char_list=["a", "»"])
     config.update_excluded_characters()
     assert "»" not in config.excluded_characters
+
+
+def test_legacy_timing_parameters_deprecation():
+    """Test deprecation warnings and backward compatibility for legacy timing parameters."""
+    config = CtcSegmentationParameters()
+
+    # Accessing index_duration_in_seconds emits DeprecationWarning
+    with pytest.deprecated_call():
+        _ = config.index_duration_in_seconds
+
+    # Setting index_duration_in_seconds emits DeprecationWarning
+    with pytest.deprecated_call():
+        config.index_duration_in_seconds = 0.040
+    assert config.index_duration == 0.040
+
+    # Setting subsampling_factor emits DeprecationWarning
+    with pytest.deprecated_call():
+        config.subsampling_factor = 4
+
+    # Accessing subsampling_factor emits DeprecationWarning
+    with pytest.deprecated_call():
+        assert config.subsampling_factor == 4
+
+    # Setting frame_duration_ms emits DeprecationWarning and updates index_duration
+    with pytest.deprecated_call():
+        config.frame_duration_ms = 30
+    assert config.index_duration == (30 * 4) / 1000.0
+
+    # Accessing frame_duration_ms emits DeprecationWarning
+    with pytest.deprecated_call():
+        assert config.frame_duration_ms == 30
+
+    # Test initializing via kwargs with legacy parameters
+    with pytest.deprecated_call():
+        config_legacy = CtcSegmentationParameters(subsampling_factor=2, frame_duration_ms=20)
+    assert config_legacy.index_duration == (20 * 2) / 1000.0
 
 
 def test_ctc_segmentation():
@@ -430,3 +467,137 @@ lpz = np.array(
     ],
     dtype=np.float32,
 )
+
+
+def test_syncope_mask():
+    """Test the generation of is_syncope_token mask across preparation methods."""
+    char_list = ["•", "a", "c", "d", "g", "o", "s", "t"]
+    config = CtcSegmentationParameters(
+        char_list=char_list,
+        syncope_tokens=["a", "o"],
+        syncope_penalty=0.3,
+    )
+    # Test deprecated alias
+    assert config.syncopy_penalty == 0.3
+
+    # Test prepare_text
+    text = ["cat", "dog"]
+    gt_mat, utt_indices = prepare_text(config, text, char_list)
+    assert config.is_syncope_token is not None
+    assert len(config.is_syncope_token) == gt_mat.shape[0]
+    # Ground truth: '#', '·', 'c', 'a', 't', '·', 'd', 'o', 'g', '·'
+    # 'a' is at index 3, 'o' is at index 7
+    assert config.is_syncope_token[3] == 1
+    assert config.is_syncope_token[7] == 1
+    assert config.is_syncope_token[2] == 0  # 'c'
+    assert config.is_syncope_token[4] == 0  # 't'
+
+    # Test deprecated alias works
+    assert config.is_optional_vowel is not None
+    assert config.is_optional_vowel[3] == 1
+
+    # Test prepare_token_list
+    tok_list = [np.array([2, 1, 7]), np.array([3, 5, 4])]  # [c, a, t], [d, o, g]
+    gt_mat, utt_indices = prepare_token_list(config, tok_list)
+    assert config.is_syncope_token is not None
+    assert len(config.is_syncope_token) == gt_mat.shape[0]
+    # Ground truth: [-1, 0, 2(c), 1(a), 7(t), 0, 3(d), 5(o), 4(g), 0]
+    # 1(a) is at index 3, 5(o) is at index 7
+    assert config.is_syncope_token[3] == 1
+    assert config.is_syncope_token[7] == 1
+    assert config.is_syncope_token[2] == 0  # 2(c)
+    assert config.is_syncope_token[4] == 0  # 7(t)
+
+
+def test_syncope_trellis_with_token_skip():
+    """Test syncope trellis when syncope token is spoken vs omitted."""
+    char_list = ["•", "c1", "v1", "c2"]
+    # Blank is 0, c1 is 1, v1 is 2, c2 is 3
+    config = CtcSegmentationParameters(
+        char_list=char_list,
+        syncope_tokens=["v1"],
+        syncope_penalty=0.25,
+        min_window_size=30,
+        score_min_mean_over_L=2,
+    )
+    tokens = [np.array([1, 2, 3])]  # c1, v1, c2
+    gt_mat, utt_indices = prepare_token_list(config, tokens)
+    # gt_mat: [-1, 0(blank), 1(c1), 2(v1), 3(c2), 0(blank)]
+    # indices:   0,        1,     2,     3,     4,        5
+    assert config.is_syncope_token[3] == 1
+
+    # Case 1: Token is spoken in audio (c1 -> v1 -> c2)
+    # Timesteps: 0..2 blank, 3..5 c1, 6..8 v1, 9..11 c2, 12..14 blank
+    T = 15
+    V = len(char_list)
+    lpz_spoken = np.full((T, V), -10.0, dtype=np.float32)
+    lpz_spoken[0:3, 0] = 0.0   # blank
+    lpz_spoken[3:6, 1] = 0.0   # c1
+    lpz_spoken[6:9, 2] = 0.0   # v1
+    lpz_spoken[9:12, 3] = 0.0  # c2
+    lpz_spoken[12:15, 0] = 0.0 # blank
+
+    timings_1, probs_1, states_1 = ctc_segmentation(config, lpz_spoken, gt_mat)
+    # In spoken case, v1 (state 3) should have non-zero timing and appear in states
+    assert "v1" in states_1
+    assert timings_1[3] > 0.0
+
+    # Case 2: Token is omitted/syncope'd in audio (c1 -> c2 directly, v1 skipped)
+    # Timesteps: 0..2 blank, 3..6 c1, 7..10 c2, 11..13 blank
+    T2 = 14
+    lpz_omitted = np.full((T2, V), -10.0, dtype=np.float32)
+    lpz_omitted[0:3, 0] = 0.0   # blank
+    lpz_omitted[3:7, 1] = 0.0   # c1
+    lpz_omitted[7:11, 3] = 0.0  # c2 (v1 omitted, prob is -10)
+    lpz_omitted[11:14, 0] = 0.0 # blank
+
+    timings_2, probs_2, states_2 = ctc_segmentation(config, lpz_omitted, gt_mat)
+    # In syncopated case, v1 (state 3) should be skipped (duration 0.0, not in states)
+    assert "v1" not in states_2
+    assert "c1" in states_2
+    assert "c2" in states_2
+    assert timings_2[3] == 0.0  # skipped token has 0 timing
+
+    # Utterance segment confidence should remain high despite dropped token
+    segments = determine_utterance_segments(config, utt_indices, probs_2, timings_2, ["c1 v1 c2"])
+    start, end, conf = segments[0]
+    assert conf > -1.0  # High confidence
+
+
+def test_syncope_trellis_text_preparation():
+    """Test syncope trellis using prepare_text with character sequences."""
+    char_list = ["•", "c", "a", "t"]
+    config = CtcSegmentationParameters(
+        char_list=char_list,
+        syncope_tokens=["a"],
+        syncope_penalty=0.3,
+        min_window_size=30,
+        score_min_mean_over_L=2,
+    )
+    text = ["cat"]
+    gt_mat, utt_indices = prepare_text(config, text, char_list)
+    # ground_truth: '#', '·', 'c', 'a', 't', '·'
+    # indices:       0,   1,   2,   3,   4,   5
+    assert config.is_syncope_token[3] == 1  # 'a' is optional syncope token
+
+    # Audio emits 'c' -> 't' (skipping 'a')
+    T = 12
+    V = len(char_list)
+    lpz = np.full((T, V), -10.0, dtype=np.float32)
+    lpz[0:2, 0] = 0.0   # blank
+    lpz[2:6, 1] = 0.0   # 'c'
+    lpz[6:10, 3] = 0.0  # 't' ('a' is skipped)
+    lpz[10:12, 0] = 0.0 # blank
+
+    timings, probs, states = ctc_segmentation(config, lpz, gt_mat)
+    assert "a" not in states
+    assert "c" in states
+    assert "t" in states
+    assert timings[3] == 0.0  # 'a' skipped
+
+    segments = determine_utterance_segments(config, utt_indices, probs, timings, text)
+    start, end, conf = segments[0]
+    assert conf > -1.0
+
+
+
