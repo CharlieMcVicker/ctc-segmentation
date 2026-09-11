@@ -62,12 +62,87 @@ class CtcSegmentationParameters:
     excluded_characters: str = ".,»«•❍·"
     tokenized_meta_symbol: str = "▁"
     char_list: Optional[Union[List[str], Tuple[str, ...], Set[str], Sequence[str]]] = None
-    syncopy_penalty: float = 0.25
-    optional_vowel_tokens: Optional[Sequence[Union[str, int]]] = None
-    is_optional_vowel: Optional[np.ndarray] = None
+    syncope_penalty: float = 0.25
+    syncope_tokens: Optional[Sequence[Union[str, int]]] = None
+    is_syncope_token: Optional[np.ndarray] = None
     # legacy Parameters (deprecated, use index_duration instead)
     _subsampling_factor: Optional[Union[int, float]] = None
     _frame_duration_ms: Optional[Union[int, float]] = None
+
+    @property
+    def syncopy_penalty(self) -> float:
+        """Deprecated alias for syncope_penalty.
+
+        .. deprecated::
+            Use `syncope_penalty` instead.
+        """
+        warnings.warn(
+            "syncopy_penalty is deprecated and will be removed in a future version. "
+            "Use syncope_penalty instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.syncope_penalty
+
+    @syncopy_penalty.setter
+    def syncopy_penalty(self, value: float) -> None:
+        warnings.warn(
+            "syncopy_penalty is deprecated and will be removed in a future version. "
+            "Use syncope_penalty instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.syncope_penalty = value
+
+    @property
+    def optional_vowel_tokens(self) -> Optional[Sequence[Union[str, int]]]:
+        """Deprecated alias for syncope_tokens.
+
+        .. deprecated::
+            Use `syncope_tokens` instead.
+        """
+        warnings.warn(
+            "optional_vowel_tokens is deprecated and will be removed in a future version. "
+            "Use syncope_tokens instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.syncope_tokens
+
+    @optional_vowel_tokens.setter
+    def optional_vowel_tokens(self, value: Optional[Sequence[Union[str, int]]]) -> None:
+        warnings.warn(
+            "optional_vowel_tokens is deprecated and will be removed in a future version. "
+            "Use syncope_tokens instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.syncope_tokens = value
+
+    @property
+    def is_optional_vowel(self) -> Optional[np.ndarray]:
+        """Deprecated alias for is_syncope_token.
+
+        .. deprecated::
+            Use `is_syncope_token` instead.
+        """
+        warnings.warn(
+            "is_optional_vowel is deprecated and will be removed in a future version. "
+            "Use is_syncope_token instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.is_syncope_token
+
+    @is_optional_vowel.setter
+    def is_optional_vowel(self, value: Optional[np.ndarray]) -> None:
+        warnings.warn(
+            "is_optional_vowel is deprecated and will be removed in a future version. "
+            "Use is_syncope_token instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.is_syncope_token = value
 
     @property
     def subsampling_factor(self) -> Optional[Union[int, float]]:
@@ -201,16 +276,27 @@ def ctc_segmentation(
     config: CtcSegmentationParameters,
     lpz: np.ndarray,
     ground_truth: np.ndarray,
+    is_syncope_token: Optional[Union[np.ndarray, Sequence[int]]] = None,
     is_optional_vowel: Optional[Union[np.ndarray, Sequence[int]]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """Extract character-level utterance alignments.
 
     :param config: an instance of CtcSegmentationParameters
     :param lpz: probabilities obtained from CTC output
-    :param ground_truth:  ground truth text in the form of a label sequence
-    :param is_optional_vowel: optional 1D mask marking optional vowel positions
+    :param ground_truth: ground truth text in the form of a label sequence
+    :param is_syncope_token: optional 1D mask marking optional syncope token positions
+    :param is_optional_vowel: deprecated alias for is_syncope_token
     :return:
     """
+    if is_syncope_token is None and is_optional_vowel is not None:
+        warnings.warn(
+            "is_optional_vowel is deprecated and will be removed in a future version. "
+            "Use is_syncope_token instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        is_syncope_token = is_optional_vowel
+
     blank = config.blank
     offset = 0
     audio_duration = lpz.shape[0] * config.index_duration
@@ -221,18 +307,22 @@ def ctc_segmentation(
     )
     if len(ground_truth) > lpz.shape[0] and config.skip_prob <= config.max_prob:
         raise AssertionError("Audio is shorter than text!")
-    if is_optional_vowel is None:
-        if (
-            getattr(config, "is_optional_vowel", None) is not None
-            and len(config.is_optional_vowel) == len(ground_truth)
-        ):
-            is_optional_vowel_arr = config.is_optional_vowel
+    if is_syncope_token is None:
+        mask = getattr(config, "is_syncope_token", None)
+        if mask is None:
+            mask = getattr(config, "is_optional_vowel", None)
+        if mask is not None and len(mask) == len(ground_truth):
+            is_syncope_token_arr = mask
         else:
-            is_optional_vowel_arr = np.zeros(len(ground_truth), dtype=np.int8)
+            is_syncope_token_arr = np.zeros(len(ground_truth), dtype=np.int8)
     else:
-        is_optional_vowel_arr = np.asarray(is_optional_vowel, dtype=np.int8)
+        is_syncope_token_arr = np.asarray(is_syncope_token, dtype=np.int8)
 
-    syncopy_penalty = float(getattr(config, "syncopy_penalty", 0.25))
+    syncope_penalty = float(
+        getattr(config, "syncope_penalty", None)
+        if getattr(config, "syncope_penalty", None) is not None
+        else getattr(config, "syncopy_penalty", 0.25)
+    )
 
     window_size = config.min_window_size
     # Try multiple window lengths if it fails
@@ -250,8 +340,8 @@ def ctc_segmentation(
             lpz.astype(np.float32),
             np.array(ground_truth, dtype=np.int64),
             offsets,
-            is_optional_vowel_arr,
-            syncopy_penalty,
+            is_syncope_token_arr,
+            syncope_penalty,
             config.blank,
             config.flags,
         )
@@ -293,14 +383,14 @@ def ctc_segmentation(
                 est_stay_prob = table[t, c] - table[t - 1, c]
                 stay_prob_delta = abs(stay_prob - est_stay_prob)
 
-                # Check vowel skip transitions
-                min_vowel_skip_delta = np.inf
-                best_vowel_c_prev = None
-                best_vowel_s = None
+                # Check syncope skip transitions
+                min_syncope_skip_delta = np.inf
+                best_syncope_c_prev = None
+                best_syncope_s = None
                 if c >= 2:
                     for s in range(ground_truth.shape[1]):
                         if ground_truth[c, s] != -1:
-                            if is_optional_vowel_arr[c - 1] == 1:
+                            if is_syncope_token_arr[c - 1] == 1:
                                 for c_prev in range(max(0, c - 3), c - 1):
                                     delta_offset = offsets[c] - offsets[c_prev]
                                     t_prev = t - 1 + delta_offset
@@ -308,16 +398,16 @@ def ctc_segmentation(
                                         est_v_prob = table[t, c] - table[t_prev, c_prev]
                                         expected_v_prob = (
                                             lpz[t + offsets[c], ground_truth[c, s]]
-                                            - syncopy_penalty
+                                            - syncope_penalty
                                         )
                                         v_delta = abs(est_v_prob - expected_v_prob)
-                                        if v_delta < min_vowel_skip_delta:
-                                            min_vowel_skip_delta = v_delta
-                                            best_vowel_c_prev = c_prev
-                                            best_vowel_s = s
+                                        if v_delta < min_syncope_skip_delta:
+                                            min_syncope_skip_delta = v_delta
+                                            best_syncope_c_prev = c_prev
+                                            best_syncope_s = s
                             elif (
                                 c >= 3
-                                and is_optional_vowel_arr[c - 2] == 1
+                                and is_syncope_token_arr[c - 2] == 1
                                 and (
                                     ground_truth[c - 1, 0] == blank
                                     or ground_truth[c - 1, 0] == -1
@@ -330,30 +420,30 @@ def ctc_segmentation(
                                         est_v_prob = table[t, c] - table[t_prev, c_prev]
                                         expected_v_prob = (
                                             lpz[t + offsets[c], ground_truth[c, s]]
-                                            - syncopy_penalty
+                                            - syncope_penalty
                                         )
                                         v_delta = abs(est_v_prob - expected_v_prob)
-                                        if v_delta < min_vowel_skip_delta:
-                                            min_vowel_skip_delta = v_delta
-                                            best_vowel_c_prev = c_prev
-                                            best_vowel_s = s
+                                        if v_delta < min_syncope_skip_delta:
+                                            min_syncope_skip_delta = v_delta
+                                            best_syncope_c_prev = c_prev
+                                            best_syncope_s = s
 
                 # Check which transition has been taken
                 if (
-                    min_vowel_skip_delta < min_switch_prob_delta
-                    and min_vowel_skip_delta < stay_prob_delta
-                    and best_vowel_c_prev is not None
+                    min_syncope_skip_delta < min_switch_prob_delta
+                    and min_syncope_skip_delta < stay_prob_delta
+                    and best_syncope_c_prev is not None
                 ):
-                    # Apply reverse vowel skip transition
+                    # Apply reverse syncope skip transition
                     if c > 0:
                         timings[c] = (offsets[c] + t) * config.index_duration
                         char_probs[offsets[c] + t] = lpz[
-                            t + offsets[c], ground_truth[c, best_vowel_s]
+                            t + offsets[c], ground_truth[c, best_syncope_s]
                         ]
-                        char_index = ground_truth[c, best_vowel_s]
+                        char_index = ground_truth[c, best_syncope_s]
                         state_list[offsets[c] + t] = config.char_list[char_index]
-                    offset = offsets[c] - offsets[best_vowel_c_prev]
-                    c = best_vowel_c_prev
+                    offset = offsets[c] - offsets[best_syncope_c_prev]
+                    c = best_syncope_c_prev
                     t -= 1 - offset
                 elif stay_prob_delta > min_switch_prob_delta:
                     # Apply reverse switch transition
@@ -366,6 +456,7 @@ def ctc_segmentation(
                         char_probs[offsets[c] + t] = max_lpz_prob
                         char_index = ground_truth[c, min_s]
                         state_list[offsets[c] + t] = config.char_list[char_index]
+                    # Update column index and delta t
                     offset = offsets[c] - (offsets[c - 1 - min_s] if c - min_s > 0 else 0)
                     c -= 1 + min_s
                     t -= 1 - offset
@@ -375,20 +466,47 @@ def ctc_segmentation(
                     state_list[offsets[c] + t] = config.self_transition
                     t -= 1
         except IndexError:
-            logger.warning(
-                "IndexError: Backtracking was not successful, "
-                "the window size might be too small."
-            )
+            logger.debug(f"Failed to backtrack table with size {table.shape}")
+            if window_size >= config.max_window_size or window_size >= lpz.shape[0]:
+                raise AssertionError("Alignment failed!")
             window_size *= 2
-            if window_size < config.max_window_size:
-                logger.warning("Increasing the window size to: " + str(window_size))
-                continue
-            else:
-                logger.error("Maximum window size reached.")
-                logger.error("Check data and character list!")
-                raise
+            continue
         break
     return timings, char_probs, state_list
+
+
+def _create_syncope_mask(
+    config: CtcSegmentationParameters,
+    ground_truth: Union[Sequence[Any], np.ndarray],
+    is_token_ids: bool = False,
+) -> np.ndarray:
+    """Create a 1D int8 mask indicating syncope token positions in ground_truth."""
+    mask = np.zeros(len(ground_truth), dtype=np.int8)
+    tokens = config.syncope_tokens
+    if tokens is None:
+        return mask
+    syncope_set = set(tokens)
+    for idx, item in enumerate(ground_truth):
+        if is_token_ids:
+            if item in syncope_set:
+                mask[idx] = 1
+            elif (
+                config.char_list is not None
+                and isinstance(item, (int, np.integer))
+                and 0 <= item < len(config.char_list)
+                and config.char_list[item] in syncope_set
+            ):
+                mask[idx] = 1
+        else:
+            if item in syncope_set:
+                mask[idx] = 1
+            elif (
+                config.char_list is not None
+                and item in config.char_list
+                and config.char_list.index(item) in syncope_set
+            ):
+                mask[idx] = 1
+    return mask
 
 
 def _create_optional_vowel_mask(
@@ -396,32 +514,14 @@ def _create_optional_vowel_mask(
     ground_truth: Union[Sequence[Any], np.ndarray],
     is_token_ids: bool = False,
 ) -> np.ndarray:
-    """Create a 1D int8 mask indicating optional vowel positions in ground_truth."""
-    mask = np.zeros(len(ground_truth), dtype=np.int8)
-    if config.optional_vowel_tokens is None:
-        return mask
-    optional_set = set(config.optional_vowel_tokens)
-    for idx, item in enumerate(ground_truth):
-        if is_token_ids:
-            if item in optional_set:
-                mask[idx] = 1
-            elif (
-                config.char_list is not None
-                and isinstance(item, (int, np.integer))
-                and 0 <= item < len(config.char_list)
-                and config.char_list[item] in optional_set
-            ):
-                mask[idx] = 1
-        else:
-            if item in optional_set:
-                mask[idx] = 1
-            elif (
-                config.char_list is not None
-                and item in config.char_list
-                and config.char_list.index(item) in optional_set
-            ):
-                mask[idx] = 1
-    return mask
+    """Deprecated alias for _create_syncope_mask."""
+    warnings.warn(
+        "_create_optional_vowel_mask is deprecated and will be removed in a future version. "
+        "Use _create_syncope_mask instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return _create_syncope_mask(config, ground_truth, is_token_ids=is_token_ids)
 
 
 def prepare_text(
@@ -478,7 +578,7 @@ def prepare_text(
             if span in config.char_list:
                 char_index = config.char_list.index(span)
                 ground_truth_mat[i, s] = char_index
-    config.is_optional_vowel = _create_optional_vowel_mask(
+    config.is_syncope_token = _create_syncope_mask(
         config, ground_truth, is_token_ids=False
     )
     return ground_truth_mat, utt_begin_indices
@@ -524,7 +624,7 @@ def prepare_tokenized_text(
         else:
             char_index = config.char_list.index(ground_truth[i])
             ground_truth_mat[i, 0] = char_index
-    config.is_optional_vowel = _create_optional_vowel_mask(
+    config.is_syncope_token = _create_syncope_mask(
         config, ground_truth, is_token_ids=False
     )
     return ground_truth_mat, utt_begin_indices
@@ -562,7 +662,7 @@ def prepare_token_list(
     utt_begin_indices.append(len(ground_truth) - 1)
     # Create matrix: time frame x number of letters the character symbol spans
     ground_truth_mat = np.array(ground_truth, dtype=np.int64).reshape(-1, 1)
-    config.is_optional_vowel = _create_optional_vowel_mask(
+    config.is_syncope_token = _create_syncope_mask(
         config, ground_truth, is_token_ids=True
     )
     return ground_truth_mat, utt_begin_indices

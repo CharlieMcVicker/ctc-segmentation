@@ -21,8 +21,8 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                       np.ndarray[np.float32_t, ndim=2] lpz,
                       np.ndarray[np.int64_t, ndim=2] ground_truth,
                       np.ndarray[np.int64_t, ndim=1] offsets,
-                      np.ndarray[np.int8_t, ndim=1] is_optional_vowel,
-                      float syncopy_penalty,
+                      np.ndarray[np.int8_t, ndim=1] is_syncope_token,
+                      float syncope_penalty,
                       int blank,
                       int flags):
     """Fill the table of transition probabilities.
@@ -31,8 +31,8 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
     :param lpz: character probabilities of each time frame
     :param ground_truth: label sequence
     :param offsets: window offsets per character (given as array of zeros)
-    :param is_optional_vowel: 1D mask array marking optional vowel positions
-    :param syncopy_penalty: penalty subtracted for vowel skip transition
+    :param is_syncope_token: 1D mask array marking optional syncope token positions
+    :param syncope_penalty: penalty subtracted for syncope skip transition
     :param blank: label ID of the blank symbol, usually 0
     :param flags: configuration options, default 0
     :return:
@@ -44,7 +44,7 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
     cdef int offset_sum = 0
     cdef int lower_offset
     cdef int higher_offset
-    cdef float switch_prob, stay_prob, skip_prob, vowel_skip_prob
+    cdef float switch_prob, stay_prob, skip_prob, syncope_skip_prob
     cdef float prob_max = -1000000000
     cdef float last_max
     cdef int last_arg_max
@@ -95,29 +95,29 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                     switch_prob = max(switch_prob, p)
                     max_lpz_prob = max(max_lpz_prob, lpz[t + offset_sum, ground_truth[c, s]])
 
-            # Compute vowel skip probability
-            vowel_skip_prob = prob_max
+            # Compute syncope skip probability
+            syncope_skip_prob = prob_max
             if c >= 2:
                 for s in range(ground_truth.shape[1]):
                     if ground_truth[c, s] != -1:
-                        # If c - 1 is an optional vowel, jump from c - 2 (or c - 3)
-                        if is_optional_vowel[c - 1] == 1:
+                        # If c - 1 is a syncope token, jump from c - 2 (or c - 3)
+                        if is_syncope_token[c - 1] == 1:
                             for c_prev in range(max(0, c - 3), c - 1):
                                 delta_offset = offset_sum - offsets[c_prev]
                                 t_prev = t - 1 + delta_offset
                                 if 0 <= t_prev < table.shape[0]:
-                                    v_prob = table[t_prev, c_prev] + lpz[t + offset_sum, ground_truth[c, s]] - syncopy_penalty
-                                    if v_prob > vowel_skip_prob:
-                                        vowel_skip_prob = v_prob
-                        # If c - 2 is an optional vowel and c - 1 is a blank/space, jump from c - 3 (or c - 4)
-                        elif c >= 3 and is_optional_vowel[c - 2] == 1 and (ground_truth[c - 1, 0] == blank or ground_truth[c - 1, 0] == -1):
+                                    v_prob = table[t_prev, c_prev] + lpz[t + offset_sum, ground_truth[c, s]] - syncope_penalty
+                                    if v_prob > syncope_skip_prob:
+                                        syncope_skip_prob = v_prob
+                        # If c - 2 is a syncope token and c - 1 is a blank/space, jump from c - 3 (or c - 4)
+                        elif c >= 3 and is_syncope_token[c - 2] == 1 and (ground_truth[c - 1, 0] == blank or ground_truth[c - 1, 0] == -1):
                             for c_prev in range(max(0, c - 4), c - 2):
                                 delta_offset = offset_sum - offsets[c_prev]
                                 t_prev = t - 1 + delta_offset
                                 if 0 <= t_prev < table.shape[0]:
-                                    v_prob = table[t_prev, c_prev] + lpz[t + offset_sum, ground_truth[c, s]] - syncopy_penalty
-                                    if v_prob > vowel_skip_prob:
-                                        vowel_skip_prob = v_prob
+                                    v_prob = table[t_prev, c_prev] + lpz[t + offset_sum, ground_truth[c, s]] - syncope_penalty
+                                    if v_prob > syncope_skip_prob:
+                                        syncope_skip_prob = v_prob
 
             # Compute stay probability
             if t - 1 < 0:
@@ -128,8 +128,8 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                 stay_prob = table[t - 1, c]
             else:
                 stay_prob = table[t - 1, c] + max(lpz[t + offset_sum, blank], max_lpz_prob)
-            # Use max of stay, switch, and vowel skip prob
-            table[t, c] = max(max(switch_prob, stay_prob), vowel_skip_prob)
+            # Use max of stay, switch, and syncope skip prob
+            table[t, c] = max(max(switch_prob, stay_prob), syncope_skip_prob)
             # Remember the row with the max prob
             if last_arg_max == -1 or last_max < table[t, c]:
                 last_max = table[t, c]

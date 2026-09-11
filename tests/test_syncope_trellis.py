@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # encoding: utf-8
 
-"""Test suite and benchmarks for syncopy-aware CTC trellis using Cherokee examples."""
+"""Test suite and benchmarks for syncope-aware CTC trellis using Cherokee examples."""
 
 import csv
 import os
@@ -64,8 +64,8 @@ def test_explicit_vowel_spoken_cherokee():
         char_list = ["•"] + sorted(list(set(word)))
         config = CtcSegmentationParameters(
             char_list=char_list,
-            optional_vowel_tokens=[dropped_vowel],
-            syncopy_penalty=0.25,
+            syncope_tokens=[dropped_vowel],
+            syncope_penalty=0.25,
             min_window_size=max(50, len(word) * 4 + 10),
             score_min_mean_over_L=2,
         )
@@ -84,7 +84,7 @@ def test_explicit_vowel_spoken_cherokee():
         ]
         # At least one ground truth position matching dropped_vowel should have duration > 0
         vowel_gt_positions = [
-            i for i in range(len(gt_mat)) if config.is_optional_vowel[i] == 1
+            i for i in range(len(gt_mat)) if config.is_syncope_token[i] == 1
         ]
         assert any(timings[pos] > 0.0 for pos in vowel_gt_positions), (
             f"Vowel '{dropped_vowel}' received 0.0s duration in explicit pronunciation of '{word}'"
@@ -92,14 +92,14 @@ def test_explicit_vowel_spoken_cherokee():
 
 
 def test_syncopated_vowel_omitted_cherokee():
-    """Test 2: When medial vowel is omitted, TRANS_VOWEL_SKIP is selected with high confidence."""
+    """Test 2: When medial vowel is omitted, syncope skip is selected with high confidence."""
     examples = load_syncope_examples()
     for row in examples:
         word = row["syllabary_transliteration"].lower()
         dropped_vowel = row["dropped_vowel"].lower()
 
         # Build surface spoken sequence by removing the first occurrence of the dropped vowel
-        # between consonants (matching medial syncopy)
+        # between consonants (matching medial syncope)
         vowel_idx_in_word = word.find(dropped_vowel, 1)  # medial position
         if vowel_idx_in_word == -1:
             vowel_idx_in_word = word.find(dropped_vowel)
@@ -109,8 +109,8 @@ def test_syncopated_vowel_omitted_cherokee():
         char_list = ["•"] + sorted(list(set(word)))
         config = CtcSegmentationParameters(
             char_list=char_list,
-            optional_vowel_tokens=[dropped_vowel],
-            syncopy_penalty=0.25,
+            syncope_tokens=[dropped_vowel],
+            syncope_penalty=0.25,
             min_window_size=max(50, len(word) * 4 + 10),
             score_min_mean_over_L=2,
         )
@@ -136,16 +136,16 @@ def test_syncopated_vowel_omitted_cherokee():
         )
         start, end, conf = segments[0]
         assert conf > -0.5, (
-            f"Utterance '{word}' confidence {conf} degraded despite valid syncopy"
+            f"Utterance '{word}' confidence {conf} degraded despite valid syncope"
         )
 
 
 def test_benchmark_cherokee_syncope_vs_baseline():
-    """Test 3: Benchmark syncopy-aware trellis vs baseline on Cherokee syncope corpus."""
+    """Test 3: Benchmark syncope-aware trellis vs baseline on Cherokee syncope corpus."""
     examples = load_syncope_examples()
     assert len(examples) == 10
 
-    syncopy_confidences = []
+    syncope_confidences = []
     baseline_confidences = []
     start_time = time.perf_counter()
 
@@ -161,24 +161,24 @@ def test_benchmark_cherokee_syncope_vs_baseline():
 
         char_list = ["•"] + sorted(list(set(word)))
 
-        # 1. Syncopy-aware run
-        config_syncopy = CtcSegmentationParameters(
+        # 1. Syncope-aware run
+        config_syncope = CtcSegmentationParameters(
             char_list=char_list,
-            optional_vowel_tokens=[dropped_vowel],
-            syncopy_penalty=0.25,
+            syncope_tokens=[dropped_vowel],
+            syncope_penalty=0.25,
             min_window_size=max(50, len(word) * 4 + 10),
             score_min_mean_over_L=2,
         )
-        gt_mat_s, utt_indices_s = prepare_text(config_syncopy, [word], char_list)
+        gt_mat_s, utt_indices_s = prepare_text(config_syncope, [word], char_list)
         lpz = make_emissions(spoken_word_chars, char_list, frames_per_char=3, blank_frames=2)
-        timings_s, probs_s, _ = ctc_segmentation(config_syncopy, lpz, gt_mat_s)
-        segs_s = determine_utterance_segments(config_syncopy, utt_indices_s, probs_s, timings_s, [word])
-        syncopy_confidences.append(segs_s[0][2])
+        timings_s, probs_s, _ = ctc_segmentation(config_syncope, lpz, gt_mat_s)
+        segs_s = determine_utterance_segments(config_syncope, utt_indices_s, probs_s, timings_s, [word])
+        syncope_confidences.append(segs_s[0][2])
 
-        # 2. Baseline run (no syncopy awareness)
+        # 2. Baseline run (no syncope awareness)
         config_base = CtcSegmentationParameters(
             char_list=char_list,
-            optional_vowel_tokens=None,
+            syncope_tokens=None,
             min_window_size=max(50, len(word) * 4 + 10),
             score_min_mean_over_L=2,
         )
@@ -190,10 +190,11 @@ def test_benchmark_cherokee_syncope_vs_baseline():
     elapsed = time.perf_counter() - start_time
 
     # Verification:
-    # 1. Syncopy-aware trellis produces consistently higher confidence under syncope
-    assert np.mean(syncopy_confidences) > np.mean(baseline_confidences)
-    for s_conf, b_conf in zip(syncopy_confidences, baseline_confidences):
+    # 1. Syncope-aware trellis produces consistently higher confidence under syncope
+    assert np.mean(syncope_confidences) > np.mean(baseline_confidences)
+    for s_conf, b_conf in zip(syncope_confidences, baseline_confidences):
         assert s_conf >= b_conf
 
     # 2. Runtime complexity remains O(T x S) and fast (< 1.0s for all 10 benchmarks)
     assert elapsed < 1.0, f"Benchmark took {elapsed:.3f}s, expected < 1.0s"
+
