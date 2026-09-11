@@ -430,3 +430,130 @@ lpz = np.array(
     ],
     dtype=np.float32,
 )
+
+
+def test_optional_vowel_mask():
+    """Test the generation of is_optional_vowel mask across preparation methods."""
+    char_list = ["•", "a", "c", "d", "g", "o", "s", "t"]
+    config = CtcSegmentationParameters(
+        char_list=char_list,
+        optional_vowel_tokens=["a", "o"],
+        syncopy_penalty=0.3,
+    )
+    # Test prepare_text
+    text = ["cat", "dog"]
+    gt_mat, utt_indices = prepare_text(config, text, char_list)
+    assert config.is_optional_vowel is not None
+    assert len(config.is_optional_vowel) == gt_mat.shape[0]
+    # Ground truth: '#', '·', 'c', 'a', 't', '·', 'd', 'o', 'g', '·'
+    # 'a' is at index 3, 'o' is at index 7
+    assert config.is_optional_vowel[3] == 1
+    assert config.is_optional_vowel[7] == 1
+    assert config.is_optional_vowel[2] == 0  # 'c'
+    assert config.is_optional_vowel[4] == 0  # 't'
+
+    # Test prepare_token_list
+    tok_list = [np.array([2, 1, 7]), np.array([3, 5, 4])]  # [c, a, t], [d, o, g]
+    gt_mat, utt_indices = prepare_token_list(config, tok_list)
+    assert config.is_optional_vowel is not None
+    assert len(config.is_optional_vowel) == gt_mat.shape[0]
+    # Ground truth: [-1, 0, 2(c), 1(a), 7(t), 0, 3(d), 5(o), 4(g), 0]
+    # 1(a) is at index 3, 5(o) is at index 7
+    assert config.is_optional_vowel[3] == 1
+    assert config.is_optional_vowel[7] == 1
+    assert config.is_optional_vowel[2] == 0  # 2(c)
+    assert config.is_optional_vowel[4] == 0  # 7(t)
+
+
+def test_syncopy_trellis_with_vowel_skip():
+    """Test syncopy trellis when vowel is spoken vs omitted."""
+    char_list = ["•", "c1", "v1", "c2"]
+    # Blank is 0, c1 is 1, v1 is 2, c2 is 3
+    config = CtcSegmentationParameters(
+        char_list=char_list,
+        optional_vowel_tokens=["v1"],
+        syncopy_penalty=0.25,
+        min_window_size=30,
+        score_min_mean_over_L=2,
+    )
+    tokens = [np.array([1, 2, 3])]  # c1, v1, c2
+    gt_mat, utt_indices = prepare_token_list(config, tokens)
+    # gt_mat: [-1, 0(blank), 1(c1), 2(v1), 3(c2), 0(blank)]
+    # indices:   0,        1,     2,     3,     4,        5
+    assert config.is_optional_vowel[3] == 1
+
+    # Case 1: Vowel is spoken in audio (c1 -> v1 -> c2)
+    # Timesteps: 0..2 blank, 3..5 c1, 6..8 v1, 9..11 c2, 12..14 blank
+    T = 15
+    V = len(char_list)
+    lpz_spoken = np.full((T, V), -10.0, dtype=np.float32)
+    lpz_spoken[0:3, 0] = 0.0   # blank
+    lpz_spoken[3:6, 1] = 0.0   # c1
+    lpz_spoken[6:9, 2] = 0.0   # v1
+    lpz_spoken[9:12, 3] = 0.0  # c2
+    lpz_spoken[12:15, 0] = 0.0 # blank
+
+    timings_1, probs_1, states_1 = ctc_segmentation(config, lpz_spoken, gt_mat)
+    # In spoken case, v1 (state 3) should have non-zero timing and appear in states
+    assert "v1" in states_1
+    assert timings_1[3] > 0.0
+
+    # Case 2: Vowel is omitted/syncope'd in audio (c1 -> c2 directly, v1 skipped)
+    # Timesteps: 0..2 blank, 3..6 c1, 7..10 c2, 11..13 blank
+    T2 = 14
+    lpz_omitted = np.full((T2, V), -10.0, dtype=np.float32)
+    lpz_omitted[0:3, 0] = 0.0   # blank
+    lpz_omitted[3:7, 1] = 0.0   # c1
+    lpz_omitted[7:11, 3] = 0.0  # c2 (v1 omitted, prob is -10)
+    lpz_omitted[11:14, 0] = 0.0 # blank
+
+    timings_2, probs_2, states_2 = ctc_segmentation(config, lpz_omitted, gt_mat)
+    # In syncopated case, v1 (state 3) should be skipped (duration 0.0, not in states)
+    assert "v1" not in states_2
+    assert "c1" in states_2
+    assert "c2" in states_2
+    assert timings_2[3] == 0.0  # skipped vowel has 0 timing
+
+    # Utterance segment confidence should remain high despite dropped vowel
+    segments = determine_utterance_segments(config, utt_indices, probs_2, timings_2, ["c1 v1 c2"])
+    start, end, conf = segments[0]
+    assert conf > -1.0  # High confidence
+
+
+def test_syncopy_trellis_text_preparation():
+    """Test syncopy trellis using prepare_text with character sequences."""
+    char_list = ["•", "c", "a", "t"]
+    config = CtcSegmentationParameters(
+        char_list=char_list,
+        optional_vowel_tokens=["a"],
+        syncopy_penalty=0.3,
+        min_window_size=30,
+        score_min_mean_over_L=2,
+    )
+    text = ["cat"]
+    gt_mat, utt_indices = prepare_text(config, text, char_list)
+    # ground_truth: '#', '·', 'c', 'a', 't', '·'
+    # indices:       0,   1,   2,   3,   4,   5
+    assert config.is_optional_vowel[3] == 1  # 'a' is optional
+
+    # Audio emits 'c' -> 't' (skipping 'a')
+    T = 12
+    V = len(char_list)
+    lpz = np.full((T, V), -10.0, dtype=np.float32)
+    lpz[0:2, 0] = 0.0   # blank
+    lpz[2:6, 1] = 0.0   # 'c'
+    lpz[6:10, 3] = 0.0  # 't' ('a' is skipped)
+    lpz[10:12, 0] = 0.0 # blank
+
+    timings, probs, states = ctc_segmentation(config, lpz, gt_mat)
+    assert "a" not in states
+    assert "c" in states
+    assert "t" in states
+    assert timings[3] == 0.0  # 'a' skipped
+
+    segments = determine_utterance_segments(config, utt_indices, probs, timings, text)
+    start, end, conf = segments[0]
+    assert conf > -1.0
+
+
+

@@ -60,6 +60,9 @@ class CtcSegmentationParameters:
     excluded_characters = ".,»«•❍·"
     tokenized_meta_symbol = "▁"
     char_list = None
+    syncopy_penalty = 0.25
+    optional_vowel_tokens = None
+    is_optional_vowel = None
     # legacy Parameters (will be ignored in future versions)
     subsampling_factor = None
     frame_duration_ms = None
@@ -127,12 +130,13 @@ class CtcSegmentationParameters:
         return output
 
 
-def ctc_segmentation(config, lpz, ground_truth):
+def ctc_segmentation(config, lpz, ground_truth, is_optional_vowel=None):
     """Extract character-level utterance alignments.
 
     :param config: an instance of CtcSegmentationParameters
     :param lpz: probabilities obtained from CTC output
     :param ground_truth:  ground truth text in the form of a label sequence
+    :param is_optional_vowel: optional 1D mask marking optional vowel positions
     :return:
     """
     blank = config.blank
@@ -145,6 +149,19 @@ def ctc_segmentation(config, lpz, ground_truth):
     )
     if len(ground_truth) > lpz.shape[0] and config.skip_prob <= config.max_prob:
         raise AssertionError("Audio is shorter than text!")
+    if is_optional_vowel is None:
+        if (
+            getattr(config, "is_optional_vowel", None) is not None
+            and len(config.is_optional_vowel) == len(ground_truth)
+        ):
+            is_optional_vowel_arr = config.is_optional_vowel
+        else:
+            is_optional_vowel_arr = np.zeros(len(ground_truth), dtype=np.int8)
+    else:
+        is_optional_vowel_arr = np.asarray(is_optional_vowel, dtype=np.int8)
+
+    syncopy_penalty = float(getattr(config, "syncopy_penalty", 0.25))
+
     window_size = config.min_window_size
     # Try multiple window lengths if it fails
     while True:
@@ -161,6 +178,8 @@ def ctc_segmentation(config, lpz, ground_truth):
             lpz.astype(np.float32),
             np.array(ground_truth, dtype=np.int64),
             offsets,
+            is_optional_vowel_arr,
+            syncopy_penalty,
             config.blank,
             config.flags,
         )
@@ -200,8 +219,71 @@ def ctc_segmentation(config, lpz, ground_truth):
                     else config.max_prob
                 )
                 est_stay_prob = table[t, c] - table[t - 1, c]
+                stay_prob_delta = abs(stay_prob - est_stay_prob)
+
+                # Check vowel skip transitions
+                min_vowel_skip_delta = np.inf
+                best_vowel_c_prev = None
+                best_vowel_s = None
+                if c >= 2:
+                    for s in range(ground_truth.shape[1]):
+                        if ground_truth[c, s] != -1:
+                            if is_optional_vowel_arr[c - 1] == 1:
+                                for c_prev in range(max(0, c - 3), c - 1):
+                                    delta_offset = offsets[c] - offsets[c_prev]
+                                    t_prev = t - 1 + delta_offset
+                                    if 0 <= t_prev < table.shape[0]:
+                                        est_v_prob = table[t, c] - table[t_prev, c_prev]
+                                        expected_v_prob = (
+                                            lpz[t + offsets[c], ground_truth[c, s]]
+                                            - syncopy_penalty
+                                        )
+                                        v_delta = abs(est_v_prob - expected_v_prob)
+                                        if v_delta < min_vowel_skip_delta:
+                                            min_vowel_skip_delta = v_delta
+                                            best_vowel_c_prev = c_prev
+                                            best_vowel_s = s
+                            elif (
+                                c >= 3
+                                and is_optional_vowel_arr[c - 2] == 1
+                                and (
+                                    ground_truth[c - 1, 0] == blank
+                                    or ground_truth[c - 1, 0] == -1
+                                )
+                            ):
+                                for c_prev in range(max(0, c - 4), c - 2):
+                                    delta_offset = offsets[c] - offsets[c_prev]
+                                    t_prev = t - 1 + delta_offset
+                                    if 0 <= t_prev < table.shape[0]:
+                                        est_v_prob = table[t, c] - table[t_prev, c_prev]
+                                        expected_v_prob = (
+                                            lpz[t + offsets[c], ground_truth[c, s]]
+                                            - syncopy_penalty
+                                        )
+                                        v_delta = abs(est_v_prob - expected_v_prob)
+                                        if v_delta < min_vowel_skip_delta:
+                                            min_vowel_skip_delta = v_delta
+                                            best_vowel_c_prev = c_prev
+                                            best_vowel_s = s
+
                 # Check which transition has been taken
-                if abs(stay_prob - est_stay_prob) > min_switch_prob_delta:
+                if (
+                    min_vowel_skip_delta < min_switch_prob_delta
+                    and min_vowel_skip_delta < stay_prob_delta
+                    and best_vowel_c_prev is not None
+                ):
+                    # Apply reverse vowel skip transition
+                    if c > 0:
+                        timings[c] = (offsets[c] + t) * config.index_duration_in_seconds
+                        char_probs[offsets[c] + t] = lpz[
+                            t + offsets[c], ground_truth[c, best_vowel_s]
+                        ]
+                        char_index = ground_truth[c, best_vowel_s]
+                        state_list[offsets[c] + t] = config.char_list[char_index]
+                    offset = offsets[c] - offsets[best_vowel_c_prev]
+                    c = best_vowel_c_prev
+                    t -= 1 - offset
+                elif stay_prob_delta > min_switch_prob_delta:
                     # Apply reverse switch transition
                     if c > 0:
                         # Log timing and character - frame alignment
@@ -212,6 +294,7 @@ def ctc_segmentation(config, lpz, ground_truth):
                         char_probs[offsets[c] + t] = max_lpz_prob
                         char_index = ground_truth[c, min_s]
                         state_list[offsets[c] + t] = config.char_list[char_index]
+                    offset = offsets[c] - (offsets[c - 1 - min_s] if c - min_s > 0 else 0)
                     c -= 1 + min_s
                     t -= 1 - offset
                 else:
@@ -234,6 +317,35 @@ def ctc_segmentation(config, lpz, ground_truth):
                 raise
         break
     return timings, char_probs, state_list
+
+
+def _create_optional_vowel_mask(config, ground_truth, is_token_ids=False):
+    """Create a 1D int8 mask indicating optional vowel positions in ground_truth."""
+    mask = np.zeros(len(ground_truth), dtype=np.int8)
+    if config.optional_vowel_tokens is None:
+        return mask
+    optional_set = set(config.optional_vowel_tokens)
+    for idx, item in enumerate(ground_truth):
+        if is_token_ids:
+            if item in optional_set:
+                mask[idx] = 1
+            elif (
+                config.char_list is not None
+                and isinstance(item, (int, np.integer))
+                and 0 <= item < len(config.char_list)
+                and config.char_list[item] in optional_set
+            ):
+                mask[idx] = 1
+        else:
+            if item in optional_set:
+                mask[idx] = 1
+            elif (
+                config.char_list is not None
+                and item in config.char_list
+                and config.char_list.index(item) in optional_set
+            ):
+                mask[idx] = 1
+    return mask
 
 
 def prepare_text(config, text, char_list=None):
@@ -286,6 +398,9 @@ def prepare_text(config, text, char_list=None):
             if span in config.char_list:
                 char_index = config.char_list.index(span)
                 ground_truth_mat[i, s] = char_index
+    config.is_optional_vowel = _create_optional_vowel_mask(
+        config, ground_truth, is_token_ids=False
+    )
     return ground_truth_mat, utt_begin_indices
 
 
@@ -326,6 +441,9 @@ def prepare_tokenized_text(config, text):
         else:
             char_index = config.char_list.index(ground_truth[i])
             ground_truth_mat[i, 0] = char_index
+    config.is_optional_vowel = _create_optional_vowel_mask(
+        config, ground_truth, is_token_ids=False
+    )
     return ground_truth_mat, utt_begin_indices
 
 
@@ -358,6 +476,9 @@ def prepare_token_list(config, text):
     utt_begin_indices.append(len(ground_truth) - 1)
     # Create matrix: time frame x number of letters the character symbol spans
     ground_truth_mat = np.array(ground_truth, dtype=np.int64).reshape(-1, 1)
+    config.is_optional_vowel = _create_optional_vowel_mask(
+        config, ground_truth, is_token_ids=True
+    )
     return ground_truth_mat, utt_begin_indices
 
 
