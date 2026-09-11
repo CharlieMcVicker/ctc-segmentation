@@ -600,4 +600,69 @@ def test_syncope_trellis_text_preparation():
     assert conf > -1.0
 
 
+def test_intrusive_token_parameters():
+    """Test CtcSegmentationParameters configuration for intrusive tokens."""
+    from ctc_segmentation.ctc_segmentation import _get_intrusive_token_ids, _create_intrusive_mask
+
+    # Default values
+    config = CtcSegmentationParameters()
+    assert config.intrusive_tokens is None
+    assert config.intrusive_penalty == 0.5
+    assert config.is_intrusive_token is None
+
+    # Constructor configuration
+    char_list = ["•", "a", "k", "e", "y", "h", "'"]
+    config2 = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h", "'"],
+        intrusive_penalty=0.6,
+    )
+    assert config2.intrusive_tokens == ["h", "'"]
+    assert config2.intrusive_penalty == 0.6
+
+    # set() method
+    config.set(char_list=char_list, intrusive_tokens=["h"], intrusive_penalty=0.4)
+    assert config.intrusive_tokens == ["h"]
+    assert config.intrusive_penalty == 0.4
+
+    # Token ID extraction and validation
+    token_ids = _get_intrusive_token_ids(config)
+    assert list(token_ids) == [5]  # 'h' is index 5
+
+    # Mask creation
+    mask = _create_intrusive_mask(config)
+    assert mask is not None
+    assert mask[5] == 1
+    assert mask[0] == 0
+    assert mask[1] == 0
+
+    # Validation against char_list: invalid token string
+    config_invalid = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["nonexistent"],
+    )
+    with pytest.raises(ValueError, match="not found in char_list"):
+        _get_intrusive_token_ids(config_invalid)
+
+    # Validation against char_list: invalid type
+    config_invalid_type = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=[3.14],
+    )
+    with pytest.raises(TypeError, match="Unsupported intrusive token type"):
+        _get_intrusive_token_ids(config_invalid_type)
+
+    # Prepare text sets is_intrusive_token
+    config3 = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h", "'"],
+    )
+    gt_mat, utt_indices = prepare_text(config3, ["akeya"], char_list)
+    assert config3.is_intrusive_token is not None
+    assert config3.is_intrusive_token[5] == 1  # 'h'
+    assert config3.is_intrusive_token[6] == 1  # "'"
+    assert config3.is_intrusive_token[1] == 0  # 'a'
+
+
+
 
