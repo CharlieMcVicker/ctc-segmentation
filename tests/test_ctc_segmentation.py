@@ -607,7 +607,8 @@ def test_intrusive_token_parameters():
     # Default values
     config = CtcSegmentationParameters()
     assert config.intrusive_tokens is None
-    assert config.intrusive_penalty == 0.5
+    assert config.intrusive_penalty == 0.1
+    assert config.intrusive_max_stride == 4
     assert config.is_intrusive_token is None
 
     # Constructor configuration
@@ -616,14 +617,35 @@ def test_intrusive_token_parameters():
         char_list=char_list,
         intrusive_tokens=["h", "'"],
         intrusive_penalty=0.6,
+        intrusive_max_stride=6,
     )
     assert config2.intrusive_tokens == ["h", "'"]
     assert config2.intrusive_penalty == 0.6
+    assert config2.intrusive_max_stride == 6
 
     # set() method
-    config.set(char_list=char_list, intrusive_tokens=["h"], intrusive_penalty=0.4)
+    config.set(
+        char_list=char_list,
+        intrusive_tokens=["h"],
+        intrusive_penalty=0.4,
+        intrusive_max_stride=2,
+    )
     assert config.intrusive_tokens == ["h"]
     assert config.intrusive_penalty == 0.4
+    assert config.intrusive_max_stride == 2
+
+    # intrusive_max_stride validation
+    with pytest.raises(ValueError, match="must be a non-negative integer"):
+        CtcSegmentationParameters(intrusive_max_stride=-1)
+
+    with pytest.raises(TypeError, match="must be an integer"):
+        CtcSegmentationParameters(intrusive_max_stride=2.5)
+
+    with pytest.raises(TypeError, match="must be an integer"):
+        CtcSegmentationParameters(intrusive_max_stride=True)
+
+    with pytest.raises(ValueError, match="must be a non-negative integer"):
+        config.intrusive_max_stride = -5
 
     # Token ID extraction and validation
     token_ids = _get_intrusive_token_ids(config)

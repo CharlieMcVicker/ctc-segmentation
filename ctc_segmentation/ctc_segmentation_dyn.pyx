@@ -25,6 +25,7 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                       float syncope_penalty,
                       np.ndarray[np.int64_t, ndim=1] intrusive_token_ids,
                       float intrusive_penalty,
+                      int intrusive_max_stride,
                       int blank,
                       int flags):
     """Fill the table of transition probabilities.
@@ -37,6 +38,7 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
     :param syncope_penalty: penalty subtracted for syncope skip transition
     :param intrusive_token_ids: 1D array of token IDs eligible for intrusive insertion
     :param intrusive_penalty: penalty subtracted for intrusive detour transition
+    :param intrusive_max_stride: maximum blank frame stride for intrusive transitions
     :param blank: label ID of the blank symbol, usually 0
     :param flags: configuration options, default 0
     :return:
@@ -54,8 +56,8 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
     cdef int last_arg_max
     cdef np.ndarray[np.int64_t, ndim=1] cur_offset = np.zeros([ground_truth.shape[1]], np.int64) - 1
     cdef float max_lpz_prob
-    cdef float p, v_prob, p_cand
-    cdef int s, c_prev, delta_offset, t_prev, j_idx, j
+    cdef float p, v_prob, p_cand, blank_sum
+    cdef int s, c_prev, delta_offset, t_prev, j_idx, j, delta, b_t
     cdef int num_intrusive_tokens = intrusive_token_ids.shape[0]
     cdef int stay_transition_cost_zero
     cdef int preamble_transition_cost_zero
@@ -124,7 +126,7 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                                     if v_prob > syncope_skip_prob:
                                         syncope_skip_prob = v_prob
 
-            # Compute intrusive detour probability
+            # Compute intrusive detour probability with blank-stride tolerance
             intrusive_prob = prob_max
             if num_intrusive_tokens > 0 and c >= 1 and t >= 2:
                 for j_idx in range(num_intrusive_tokens):
@@ -135,11 +137,21 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                                 delta_offset = offset_sum - offsets[c - 1 - s]
                             else:
                                 delta_offset = offset_sum
-                            t_prev = t - 2 + delta_offset
-                            if 0 <= t_prev < table.shape[0]:
-                                p_cand = table[t_prev, c - 1 - s] + lpz[t - 1 + offset_sum, j] - intrusive_penalty + lpz[t + offset_sum, ground_truth[c, s]]
-                                if p_cand > intrusive_prob:
-                                    intrusive_prob = p_cand
+                            for delta in range(0, min(intrusive_max_stride + 1, t - 1)):
+                                t_prev = t - 2 - delta + delta_offset
+                                if 0 <= t_prev < table.shape[0]:
+                                    blank_sum = 0.0
+                                    for b_t in range(t - delta, t):
+                                        blank_sum += lpz[b_t + offset_sum, blank]
+                                    p_cand = (
+                                        table[t_prev, c - 1 - s]
+                                        + lpz[t - 1 - delta + offset_sum, j]
+                                        - intrusive_penalty
+                                        + blank_sum
+                                        + lpz[t + offset_sum, ground_truth[c, s]]
+                                    )
+                                    if p_cand > intrusive_prob:
+                                        intrusive_prob = p_cand
 
             # Compute stay probability
             if t - 1 < 0:
