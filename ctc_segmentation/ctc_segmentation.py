@@ -67,7 +67,8 @@ class CtcSegmentationParameters:
         is_syncope_token: 1D mask marking syncope token positions in ground truth.
         intrusive_tokens: Sequence of tokens (strings or integer IDs) permitted as intrusive acoustic
             detours between ground-truth label transitions (e.g. epenthesis, aspiration, glottal stops).
-        intrusive_penalty: Log-space penalty subtracted from intrusive detour transitions (default: 0.5).
+        intrusive_penalty: Log-space penalty subtracted from intrusive detour transitions (default: 0.1).
+        intrusive_max_stride: Maximum blank frame stride permitted for blank-tolerant intrusive transitions (default: 4).
         is_intrusive_token: 1D mask across vocabulary indices marking eligible intrusive tokens.
     """
 
@@ -93,11 +94,29 @@ class CtcSegmentationParameters:
     is_syncope_token: Optional[np.ndarray] = None
     # Intrusive Token Subsystem
     intrusive_tokens: Optional[Sequence[Union[str, int]]] = None
-    intrusive_penalty: float = 0.5
+    intrusive_penalty: float = 0.1
+    _intrusive_max_stride: int = 4
     is_intrusive_token: Optional[np.ndarray] = None
     # legacy Parameters (deprecated, use index_duration instead)
     _subsampling_factor: Optional[Union[int, float]] = None
     _frame_duration_ms: Optional[Union[int, float]] = None
+
+    @property
+    def intrusive_max_stride(self) -> int:
+        """Maximum blank frame stride permitted for intrusive token transitions."""
+        return self._intrusive_max_stride
+
+    @intrusive_max_stride.setter
+    def intrusive_max_stride(self, value: int) -> None:
+        if not isinstance(value, (int, np.integer)) or isinstance(value, bool):
+            raise TypeError(
+                f"intrusive_max_stride must be an integer, got {type(value).__name__}"
+            )
+        if value < 0:
+            raise ValueError(
+                f"intrusive_max_stride must be a non-negative integer, got {value}"
+            )
+        self._intrusive_max_stride = int(value)
 
     @property
     def syncopy_penalty(self) -> float:
@@ -349,8 +368,6 @@ def ctc_segmentation(
         raise AssertionError("Audio is shorter than text!")
     if is_syncope_token is None:
         mask = getattr(config, "is_syncope_token", None)
-        if mask is None:
-            mask = getattr(config, "is_optional_vowel", None)
         if mask is not None and len(mask) == len(ground_truth):
             is_syncope_token_arr = mask
         else:
@@ -358,15 +375,12 @@ def ctc_segmentation(
     else:
         is_syncope_token_arr = np.asarray(is_syncope_token, dtype=np.int8)
 
-    syncope_penalty = float(
-        getattr(config, "syncope_penalty", None)
-        if getattr(config, "syncope_penalty", None) is not None
-        else getattr(config, "syncopy_penalty", 0.25)
-    )
+    syncope_penalty = float(getattr(config, "syncope_penalty", 0.25))
 
     intrusive_token_ids = _get_intrusive_token_ids(config)
     num_intrusive_tokens = len(intrusive_token_ids)
-    intrusive_penalty = float(getattr(config, "intrusive_penalty", 0.5))
+    intrusive_penalty = float(getattr(config, "intrusive_penalty", 0.1))
+    intrusive_max_stride = int(getattr(config, "intrusive_max_stride", 4))
 
     window_size = config.min_window_size
     # Try multiple window lengths if it fails
@@ -388,6 +402,7 @@ def ctc_segmentation(
             syncope_penalty,
             intrusive_token_ids,
             intrusive_penalty,
+            intrusive_max_stride,
             config.blank,
             config.flags,
         )
@@ -478,24 +493,32 @@ def ctc_segmentation(
                 min_intrusive_delta = np.inf
                 best_intrusive_j = None
                 best_intrusive_s = None
+                best_intrusive_stride = 0
                 if c >= 1 and t >= 2 and num_intrusive_tokens > 0:
                     for s in range(ground_truth.shape[1]):
-                        if ground_truth[c, s] != -1:
-                            offset = offsets[c] - (offsets[c - 1 - s] if c - 1 - s >= 0 else 0)
-                            t_prev = t - 2 + offset
-                            if 0 <= t_prev < table.shape[0]:
-                                for j in intrusive_token_ids:
-                                    expected_p = (
-                                        table[t_prev, c - 1 - s]
-                                        + lpz[t - 1 + offsets[c], j]
-                                        - intrusive_penalty
-                                        + lpz[t + offsets[c], ground_truth[c, s]]
-                                    )
-                                    delta = abs(table[t, c] - expected_p)
-                                    if delta < min_intrusive_delta:
-                                        min_intrusive_delta = delta
-                                        best_intrusive_j = j
-                                        best_intrusive_s = s
+                        if ground_truth[c, s] == -1 or c - 1 - s < 0:
+                            continue
+                        offset = offsets[c] - offsets[c - 1 - s]
+                        for delta in range(0, min(intrusive_max_stride + 1, t - 1)):
+                                t_prev = t - 2 - delta + offset
+                                if 0 <= t_prev < table.shape[0]:
+                                    blank_sum = 0.0
+                                    for b_t in range(t - delta, t):
+                                        blank_sum += lpz[b_t + offsets[c], blank]
+                                    for j in intrusive_token_ids:
+                                        expected_p = (
+                                            table[t_prev, c - 1 - s]
+                                            + lpz[t - 1 - delta + offsets[c], j]
+                                            - intrusive_penalty
+                                            + blank_sum
+                                            + lpz[t + offsets[c], ground_truth[c, s]]
+                                        )
+                                        diff = abs(table[t, c] - expected_p)
+                                        if diff < min_intrusive_delta:
+                                            min_intrusive_delta = diff
+                                            best_intrusive_j = j
+                                            best_intrusive_s = s
+                                            best_intrusive_stride = delta
 
                 # Check which transition has been taken
                 if (
@@ -531,13 +554,18 @@ def ctc_segmentation(
                             t + offsets[c], char_index
                         ]
                         state_list[offsets[c] + t] = config.char_list[char_index]
-                        char_probs[offsets[c] + t - 1] = lpz[
-                            t - 1 + offsets[c], best_intrusive_j
+                        for b_t in range(t - best_intrusive_stride, t):
+                            char_probs[offsets[c] + b_t] = lpz[
+                                offsets[c] + b_t, blank
+                            ]
+                            state_list[offsets[c] + b_t] = config.self_transition
+                        char_probs[offsets[c] + t - 1 - best_intrusive_stride] = lpz[
+                            t - 1 - best_intrusive_stride + offsets[c], best_intrusive_j
                         ]
-                        state_list[offsets[c] + t - 1] = config.char_list[best_intrusive_j]
+                        state_list[offsets[c] + t - 1 - best_intrusive_stride] = config.char_list[best_intrusive_j]
                     offset = offsets[c] - (offsets[c - 1 - best_intrusive_s] if c - 1 - best_intrusive_s >= 0 else 0)
                     c -= 1 + best_intrusive_s
-                    t -= 2 - offset
+                    t -= (2 + best_intrusive_stride) - offset
                 elif stay_prob_delta > min_switch_prob_delta:
                     # Apply reverse switch transition
                     if c > 0:

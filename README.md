@@ -166,16 +166,17 @@ To align text when speakers insert unwritten surface sounds (e.g. pre-/post-aspi
 import numpy as np
 import ctc_segmentation
 
-# Configure parameters with candidate intrusive tokens and penalty
+# Configure parameters with candidate intrusive tokens, penalty, and blank stride tolerance
 char_list = ["•", "a", "k", "e", "y", "h", "'"]
 config = ctc_segmentation.CtcSegmentationParameters(
     char_list=char_list,
     intrusive_tokens=["h", "'"],  # intrusive tokens permitted between ground-truth states
-    intrusive_penalty=0.5,        # log-space penalty subtracted from intrusive detour transitions
+    intrusive_penalty=0.1,        # log-space penalty subtracted from intrusive detour transitions (default: 0.1)
+    intrusive_max_stride=4,       # maximum blank frame stride bridging intrusive tokens (default: 4)
 )
 
 # Prepare ground truth and run alignment
-# If citation 'akeya' is spoken as surface 'akeyha', the trellis takes a single-slot detour through 'h'
+# If citation 'akeya' is spoken as surface 'akeyha', the trellis takes a blank-tolerant detour through 'h'
 text = ["akeya"]
 ground_truth_mat, utt_begin_indices = ctc_segmentation.prepare_text(config, text)
 timings, char_probs, state_list = ctc_segmentation.ctc_segmentation(config, probs, ground_truth_mat)
@@ -223,14 +224,28 @@ To support syncope in $O(T \times S)$ polynomial time, the trellis evaluates an 
   $$\text{syncope\_skip\_prob} = \text{table}[t-1, c_{\text{prev}}] - \lambda_{\text{syncope}}$$
   where $\lambda_{\text{syncope}} \ge 0$ is a configurable penalty (parameter `syncope_penalty`, default: `0.25`).
 
-#### Intrusive Token Transitions (Single-Slot Detours)
+#### Intrusive Token Transitions (Blank-Tolerant Detours)
 
 In many languages and dialects, speakers pronounce intrusive sounds (e.g. pre-/post-aspiration `/h/`, glottal stop `/'/`, or epenthetic consonants) that are absent from canonical citation transcripts. Standard CTC segmentation trellises only permit transitions among characters present in the transcript, forcing acoustic evidence for intrusive phonemes into adjacent consonants or blanks.
 
-To capture intrusive sounds dynamically in $O(T \times S \times |J_{\text{intrusive}}|)$ time:
-* **Single-Slot Intrusive Detour**: Between ground-truth character states $c-1$ and $c$, the dynamic programming trellis allows taking a 1-frame detour through candidate intrusive token $j \in J$:
-  $$P_{\text{intrusive}}(t, c, j) = \text{table}[t - 2 + \text{offset}, c - 1] + \text{lpz}[t - 1, j] - \lambda_{\text{intrusive}} + \text{lpz}[t, L(c)]$$
-  where $\lambda_{\text{intrusive}} \ge 0$ is a configurable penalty (parameter `intrusive_penalty`, default: `0.5`).
+##### The CTC Blank Gap Problem & Blank-Tolerant Recurrence
+
+CTC acoustic models emit discrete posterior peaks separated by blank (`[PAD]` / $\epsilon$) frames. An intrusive acoustic event (e.g. aspiration `/h/`) is often separated from the subsequent ground-truth state by several blank frames:
+```text
+Frame t - 1 - δ:        'h'   (intrusive token peak)
+Frames t - δ .. t - 1:  [PAD] (intervening CTC blank frames)
+Frame t:                'u'   (ground truth token state c)
+```
+
+To support intrusive transitions across CTC blank gaps in $O(T \times S \times |J_{\text{intrusive}}| \times W)$ time:
+* **Blank-Tolerant Intrusive Detour**: Between ground-truth character states $c-1$ and $c$, the dynamic programming trellis evaluates intrusive token $j \in J$ across blank frame strides $\delta \in [0, W]$:
+  $$P_{\text{intrusive}}(t, c) = \max_{j \in J} \max_{0 \le \delta \le W} \left[ \begin{aligned}
+  &\text{table}[t - 2 - \delta + \text{offset}, c - 1] \\
+  &+ \text{lpz}[t - 1 - \delta + \text{offset\_sum}, j] - \lambda_{\text{intrusive}} \\
+  &+ \sum_{b=t-\delta}^{t-1} \text{lpz}[b + \text{offset\_sum}, \text{blank}] \\
+  &+ \text{lpz}[t + \text{offset\_sum}, L(c)]
+  \end{aligned} \right]$$
+  where $W \ge 0$ is the maximum blank stride (parameter `intrusive_max_stride`, default: `4`), $\lambda_{\text{intrusive}} \ge 0$ is a configurable penalty (parameter `intrusive_penalty`, default: `0.1`), and $\text{blank}$ is the CTC blank index.
 * **Single-Slot Mutual Exclusivity**: Between any two ground-truth states, at most one intrusion is permitted, preventing ungrammatical stacking while cleanly reconstructing surface phonetic realisations.
 
 ### 2. Backtracking
@@ -241,7 +256,7 @@ Starting from the time step with the highest probability for the last character,
 
 When a syncope-skip transition was selected, backtracking recovers the jump across the omitted token, assigns `0.0s` duration to the skipped token, and does not consume audio frames for it.
 
-When an intrusive detour transition was selected, backtracking records the intrusive token $j^*$ at frame $t-1$ and the ground-truth token $L(c)$ at frame $t$, seamlessly reconstructing the surface phonetic sequence without requiring heuristic post-processing regexes.
+When an intrusive detour transition was selected, backtracking emits the intrusive token $j^*$ at frame $t-1-\delta^*$, fills any intervening frames $[t-\delta^*, t-1]$ with blank/stay tokens ($\epsilon$), and emits the ground-truth token $L(c)$ at frame $t$, seamlessly reconstructing the surface phonetic sequence without requiring heuristic post-processing regexes.
 
 ### 3. Confidence score
 
@@ -281,7 +296,8 @@ There are several notable parameters to adjust the working of the algorithm that
 ### Intrusive token parameters
 
 * `intrusive_tokens` (default: `None`): List of character strings or token IDs (e.g. `["h", "'"]`) eligible for intrusive detour insertion between ground-truth states when supported by acoustic evidence.
-* `intrusive_penalty` (default: `0.5`): Penalty in log space ($\lambda_{\text{intrusive}}$) subtracted from intrusive detour transitions. Higher values require stronger acoustic confidence to trigger insertion.
+* `intrusive_penalty` (default: `0.1`): Penalty in log space ($\lambda_{\text{intrusive}}$) subtracted from intrusive detour transitions. Higher values require stronger acoustic confidence to trigger insertion.
+* `intrusive_max_stride` (default: `4`): Maximum number of intervening CTC blank frames permitted between the intrusive token and the next ground-truth token. Allows robust phonetic alignment across CTC emission gaps.
 * `is_intrusive_token` (default: `None`): 1D `int8` mask array of size `len(char_list)` marking eligible intrusive tokens in the vocabulary. Can be passed directly or auto-generated from `intrusive_tokens` and `char_list`.
 
 ### Time stamp parameters

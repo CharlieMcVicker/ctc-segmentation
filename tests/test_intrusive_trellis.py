@@ -331,3 +331,149 @@ def test_intrusive_window_partitioning():
         assert seg[2] > -1.0, f"Utterance {i} segment confidence too low: {seg[2]}"
 
 
+@pytest.mark.parametrize("delta", [0, 1, 2, 3, 4])
+def test_blank_tolerant_intrusive_strides(delta):
+    """Test 10: Intrusive token 'h' is detected across 0, 1, 2, 3, 4 intervening CTC blank frames."""
+    word = "akeya"
+    # Ground truth: a-k-e-y-a
+    # Spoken: a, k, e, y, h, [PAD]*delta, a
+    char_list = ["•"] + sorted(list(set(word + "h")))
+    spoken_chars = ["a", "k", "e", "y", "h"] + ["•"] * delta + ["a"]
+
+    config = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h"],
+        intrusive_penalty=0.1,
+        intrusive_max_stride=4,
+        min_window_size=max(50, len(word) * 4 + 20),
+        score_min_mean_over_L=2,
+    )
+
+    gt_mat, utt_indices = prepare_text(config, [word], char_list)
+    lpz = make_emissions(spoken_chars, char_list, frames_per_char=1, blank_frames=2)
+
+    timings, char_probs, states = ctc_segmentation(config, lpz, gt_mat)
+
+    # Must contain 'h'
+    assert "h" in states, f"Expected 'h' with delta={delta} blanks, got states: {states}"
+
+    non_empty = [s for s in states if s and s != config.self_transition]
+    assert "h" in non_empty
+    y_idx = non_empty.index("y")
+    h_idx = non_empty.index("h")
+    a_idx = non_empty.index("a", h_idx)
+    assert y_idx < h_idx < a_idx, f"Order mismatch with delta={delta}: {non_empty}"
+
+    segments = determine_utterance_segments(config, utt_indices, char_probs, timings, [word])
+    assert segments[0][2] > -1.0
+
+
+def test_multi_token_intrusions_with_blanks():
+    """Test 11: Multi-candidate intrusive transitions (h, ') each detected across intervening blank frames."""
+    word_h = "akeya"
+    word_g = "tsanvsv"
+    char_list = ["•"] + sorted(list(set(word_h + word_g + "h'")))
+
+    config = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h", "'"],
+        intrusive_penalty=0.1,
+        intrusive_max_stride=4,
+        min_window_size=max(50, len(word_h + word_g) * 4 + 20),
+        score_min_mean_over_L=2,
+    )
+
+    # Case A: 'h' followed by 2 intervening blanks
+    spoken_h = ["a", "k", "e", "y", "h", "•", "•", "a"]
+    gt_mat_h, utt_h = prepare_text(config, [word_h], char_list)
+    lpz_h = make_emissions(spoken_h, char_list, frames_per_char=1, blank_frames=2)
+    _, _, states_h = ctc_segmentation(config, lpz_h, gt_mat_h)
+
+    assert "h" in states_h
+    assert "'" not in states_h
+    non_empty_h = [s for s in states_h if s and s != config.self_transition]
+    assert non_empty_h.index("y") < non_empty_h.index("h") < non_empty_h.index("a", non_empty_h.index("h"))
+
+    # Case B: "'" (glottal stop) followed by 3 intervening blanks
+    spoken_g = ["t", "s", "a", "'", "•", "•", "•", "n", "v", "s", "v"]
+    gt_mat_g, utt_g = prepare_text(config, [word_g], char_list)
+    lpz_g = make_emissions(spoken_g, char_list, frames_per_char=1, blank_frames=2)
+    _, _, states_g = ctc_segmentation(config, lpz_g, gt_mat_g)
+
+    assert "'" in states_g
+    assert "h" not in states_g
+    non_empty_g = [s for s in states_g if s and s != config.self_transition]
+    assert non_empty_g.index("a") < non_empty_g.index("'") < non_empty_g.index("n")
+
+
+def test_intrusive_max_stride_limit_enforcement():
+    """Test 12: Blank stride exceeding intrusive_max_stride is not accepted as intrusive detour."""
+    word = "akeya"
+    char_list = ["•"] + sorted(list(set(word + "h")))
+    # 5 intervening blanks between 'h' and 'a'
+    spoken_chars = ["a", "k", "e", "y", "h", "•", "•", "•", "•", "•", "a"]
+
+    # With default intrusive_max_stride=4 (cannot bridge 5 blanks)
+    config_stride4 = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h"],
+        intrusive_penalty=0.1,
+        intrusive_max_stride=4,
+        min_window_size=max(50, len(word) * 4 + 20),
+        score_min_mean_over_L=2,
+    )
+
+    gt_mat, utt_indices = prepare_text(config_stride4, [word], char_list)
+    lpz = make_emissions(spoken_chars, char_list, frames_per_char=1, blank_frames=2)
+
+    _, _, states_stride4 = ctc_segmentation(config_stride4, lpz, gt_mat)
+    # Stride of 5 blanks exceeds max_stride of 4, so 'h' cannot be inserted via intrusive detour
+    assert "h" not in states_stride4
+
+    # With intrusive_max_stride=5 (can bridge 5 blanks)
+    config_stride5 = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h"],
+        intrusive_penalty=0.1,
+        intrusive_max_stride=5,
+        min_window_size=max(50, len(word) * 4 + 20),
+        score_min_mean_over_L=2,
+    )
+
+    _, _, states_stride5 = ctc_segmentation(config_stride5, lpz, gt_mat)
+    assert "h" in states_stride5
+
+
+def test_clean_speech_with_blanks_no_spurious_intrusions():
+    """Test 13: Clean speech containing blank regions without acoustic intrusions does not insert spurious tokens."""
+    word = "akeya"
+    char_list = ["•"] + sorted(list(set(word + "h'")))
+    # Multiple blank frames between canonical characters, but no intrusive phonemes
+    spoken_chars = ["a", "•", "•", "k", "•", "e", "•", "•", "•", "y", "•", "•", "a"]
+
+    config = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h", "'"],
+        intrusive_penalty=0.1,
+        intrusive_max_stride=4,
+        min_window_size=max(50, len(word) * 4 + 20),
+        score_min_mean_over_L=2,
+    )
+
+    gt_mat, utt_indices = prepare_text(config, [word], char_list)
+    lpz = make_emissions(spoken_chars, char_list, frames_per_char=1, blank_frames=2)
+
+    timings, char_probs, states = ctc_segmentation(config, lpz, gt_mat)
+
+    # Neither 'h' nor "'" should be inserted
+    assert "h" not in states, f"Expected 'h' not to be in states, got: {states}"
+    assert "'" not in states, f"Expected \"'\" not to be in states, got: {states}"
+
+    for ch in ["a", "k", "e", "y"]:
+        assert ch in states
+
+    segments = determine_utterance_segments(config, utt_indices, char_probs, timings, [word])
+    assert segments[0][2] > -1.0
+
+
+
