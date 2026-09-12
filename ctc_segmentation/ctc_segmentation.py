@@ -496,9 +496,10 @@ def ctc_segmentation(
                 best_intrusive_stride = 0
                 if c >= 1 and t >= 2 and num_intrusive_tokens > 0:
                     for s in range(ground_truth.shape[1]):
-                        if ground_truth[c, s] != -1:
-                            offset = offsets[c] - (offsets[c - 1 - s] if c - 1 - s >= 0 else 0)
-                            for delta in range(0, min(intrusive_max_stride + 1, t - 1)):
+                        if ground_truth[c, s] == -1 or c - 1 - s < 0:
+                            continue
+                        offset = offsets[c] - offsets[c - 1 - s]
+                        for delta in range(0, min(intrusive_max_stride + 1, t - 1)):
                                 t_prev = t - 2 - delta + offset
                                 if 0 <= t_prev < table.shape[0]:
                                     blank_sum = 0.0

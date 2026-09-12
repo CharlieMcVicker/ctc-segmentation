@@ -56,7 +56,7 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
     cdef int last_arg_max
     cdef np.ndarray[np.int64_t, ndim=1] cur_offset = np.zeros([ground_truth.shape[1]], np.int64) - 1
     cdef float max_lpz_prob
-    cdef float p, v_prob, p_cand, blank_sum
+    cdef float p, v_prob, p_cand, blank_sum, base_prob
     cdef int s, c_prev, delta_offset, t_prev, j_idx, j, delta, b_t
     cdef int num_intrusive_tokens = intrusive_token_ids.shape[0]
     cdef int stay_transition_cost_zero
@@ -129,29 +129,27 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
             # Compute intrusive detour probability with blank-stride tolerance
             intrusive_prob = prob_max
             if num_intrusive_tokens > 0 and c >= 1 and t >= 2:
-                for j_idx in range(num_intrusive_tokens):
-                    j = intrusive_token_ids[j_idx]
-                    for s in range(ground_truth.shape[1]):
-                        if ground_truth[c, s] != -1:
-                            if c - 1 - s >= 0:
-                                delta_offset = offset_sum - offsets[c - 1 - s]
-                            else:
-                                delta_offset = offset_sum
-                            for delta in range(0, min(intrusive_max_stride + 1, t - 1)):
-                                t_prev = t - 2 - delta + delta_offset
-                                if 0 <= t_prev < table.shape[0]:
-                                    blank_sum = 0.0
-                                    for b_t in range(t - delta, t):
-                                        blank_sum += lpz[b_t + offset_sum, blank]
-                                    p_cand = (
-                                        table[t_prev, c - 1 - s]
-                                        + lpz[t - 1 - delta + offset_sum, j]
-                                        - intrusive_penalty
-                                        + blank_sum
-                                        + lpz[t + offset_sum, ground_truth[c, s]]
-                                    )
-                                    if p_cand > intrusive_prob:
-                                        intrusive_prob = p_cand
+                for s in range(ground_truth.shape[1]):
+                    if ground_truth[c, s] == -1 or c - 1 - s < 0:
+                        continue
+                    delta_offset = offset_sum - offsets[c - 1 - s]
+                    for delta in range(0, min(intrusive_max_stride + 1, t - 1)):
+                        t_prev = t - 2 - delta + delta_offset
+                        if 0 <= t_prev < table.shape[0]:
+                            blank_sum = 0.0
+                            for b_t in range(t - delta, t):
+                                blank_sum += lpz[b_t + offset_sum, blank]
+                            base_prob = (
+                                table[t_prev, c - 1 - s]
+                                - intrusive_penalty
+                                + blank_sum
+                                + lpz[t + offset_sum, ground_truth[c, s]]
+                            )
+                            for j_idx in range(num_intrusive_tokens):
+                                j = intrusive_token_ids[j_idx]
+                                p_cand = base_prob + lpz[t - 1 - delta + offset_sum, j]
+                                if p_cand > intrusive_prob:
+                                    intrusive_prob = p_cand
 
             # Compute stay probability
             if t - 1 < 0:
