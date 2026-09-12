@@ -30,11 +30,17 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                       int flags):
     """Fill the table of transition probabilities.
 
+    Supports blank-constrained syncope skip transitions (enforcing the Consonant
+    Preservation Invariant and Blank-Only Stride Invariants for Case A and Case B)
+    and blank-tolerant intrusive token detours.
+
     :param table: table filled with maximum joint probabilities k_{t,j}
     :param lpz: character probabilities of each time frame
     :param ground_truth: label sequence
     :param offsets: window offsets per character (given as array of zeros)
     :param is_syncope_token: 1D mask array marking optional syncope token positions
+        for blank-constrained syncope transitions (enforces the blank-only stride
+        invariant so non-syncope characters/consonants are preserved).
     :param syncope_penalty: penalty subtracted for syncope skip transition
     :param intrusive_token_ids: 1D array of token IDs eligible for intrusive insertion
     :param intrusive_penalty: penalty subtracted for intrusive detour transition
@@ -102,27 +108,46 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                     switch_prob = max(switch_prob, p)
                     max_lpz_prob = max(max_lpz_prob, lpz[t + offset_sum, ground_truth[c, s]])
 
-            # Compute syncope skip probability
+            # Compute syncope skip probability with blank-constrained stride
             syncope_skip_prob = prob_max
             if c >= 2:
                 for s in range(ground_truth.shape[1]):
                     if ground_truth[c, s] != -1:
-                        # If c - 1 is a syncope token, jump from c - 2 (or c - 3)
+                        # Case A: c - 1 is a syncope token
                         if is_syncope_token[c - 1] == 1:
-                            for c_prev in range(max(0, c - 3), c - 1):
-                                delta_offset = offset_sum - offsets[c_prev]
+                            # 1. Direct 1-token skip over syncope vowel (c - 2 -> c)
+                            delta_offset = offset_sum - offsets[c - 2]
+                            t_prev = t - 1 + delta_offset
+                            if 0 <= t_prev < table.shape[0]:
+                                v_prob = table[t_prev, c - 2] + lpz[t + offset_sum, ground_truth[c, s]] - syncope_penalty
+                                if v_prob > syncope_skip_prob:
+                                    syncope_skip_prob = v_prob
+
+                            # 2. 2-token skip (c - 3 -> c) ONLY IF c - 2 is a blank/PAD
+                            if c >= 3 and (ground_truth[c - 2, 0] == blank or ground_truth[c - 2, 0] == -1):
+                                delta_offset = offset_sum - offsets[c - 3]
                                 t_prev = t - 1 + delta_offset
                                 if 0 <= t_prev < table.shape[0]:
-                                    v_prob = table[t_prev, c_prev] + lpz[t + offset_sum, ground_truth[c, s]] - syncope_penalty
+                                    v_prob = table[t_prev, c - 3] + lpz[t + offset_sum, ground_truth[c, s]] - syncope_penalty
                                     if v_prob > syncope_skip_prob:
                                         syncope_skip_prob = v_prob
-                        # If c - 2 is a syncope token and c - 1 is a blank/space, jump from c - 3 (or c - 4)
+
+                        # Case B: c - 2 is syncope token and c - 1 is a blank/space
                         elif c >= 3 and is_syncope_token[c - 2] == 1 and (ground_truth[c - 1, 0] == blank or ground_truth[c - 1, 0] == -1):
-                            for c_prev in range(max(0, c - 4), c - 2):
-                                delta_offset = offset_sum - offsets[c_prev]
+                            # 1. Skip vowel + trailing blank (c - 3 -> c)
+                            delta_offset = offset_sum - offsets[c - 3]
+                            t_prev = t - 1 + delta_offset
+                            if 0 <= t_prev < table.shape[0]:
+                                v_prob = table[t_prev, c - 3] + lpz[t + offset_sum, ground_truth[c, s]] - syncope_penalty
+                                if v_prob > syncope_skip_prob:
+                                    syncope_skip_prob = v_prob
+
+                            # 2. Skip leading blank + vowel + trailing blank (c - 4 -> c) ONLY IF c - 3 is blank
+                            if c >= 4 and (ground_truth[c - 3, 0] == blank or ground_truth[c - 3, 0] == -1):
+                                delta_offset = offset_sum - offsets[c - 4]
                                 t_prev = t - 1 + delta_offset
                                 if 0 <= t_prev < table.shape[0]:
-                                    v_prob = table[t_prev, c_prev] + lpz[t + offset_sum, ground_truth[c, s]] - syncope_penalty
+                                    v_prob = table[t_prev, c - 4] + lpz[t + offset_sum, ground_truth[c, s]] - syncope_penalty
                                     if v_prob > syncope_skip_prob:
                                         syncope_skip_prob = v_prob
 

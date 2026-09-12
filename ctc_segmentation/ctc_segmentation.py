@@ -64,7 +64,9 @@ class CtcSegmentationParameters:
         char_list: Vocabulary list or mapping of character tokens.
         syncope_penalty: Log-space penalty subtracted for syncope skip transitions (default: 0.25).
         syncope_tokens: Sequence of tokens (strings or integer IDs) that can be skipped via syncope.
-        is_syncope_token: 1D mask marking syncope token positions in ground truth.
+        is_syncope_token: 1D mask marking syncope token positions in ground truth for
+            blank-constrained syncope transitions. Enforces the Consonant Preservation Invariant
+            and Blank-Only Stride Invariants (Case A and Case B).
         intrusive_tokens: Sequence of tokens (strings or integer IDs) permitted as intrusive acoustic
             detours between ground-truth label transitions (e.g. epenthesis, aspiration, glottal stops).
         intrusive_penalty: Log-space penalty subtracted from intrusive detour transitions (default: 0.1).
@@ -331,15 +333,20 @@ def ctc_segmentation(
     """Extract character-level utterance alignments using dynamic programming.
 
     Aligns CTC posterior probabilities `lpz` with ground-truth label matrix
-    `ground_truth`. Supports syncope-skip transitions (for optional token omission)
-    and intrusive detour transitions (for acoustic surface token insertions like
-    aspiration, epenthesis, or glottal stops).
+    `ground_truth`. Supports blank-constrained syncope-skip transitions (for optional
+    token omission while strictly enforcing the Consonant Preservation Invariant and
+    Blank-Only Stride Invariants across blank/PAD states) and intrusive detour transitions
+    (for acoustic surface token insertions like aspiration, epenthesis, or glottal stops).
 
     :param config: an instance of CtcSegmentationParameters configuring trellis alignment,
         windowing, syncope penalties, and intrusive detour parameters.
     :param lpz: log-probabilities obtained from CTC output (shape: [time_frames, vocab_size]).
     :param ground_truth: ground truth label matrix (shape: [labels_len, max_char_len]).
     :param is_syncope_token: optional 1D mask marking optional syncope token positions.
+        Syncope skips are blank-constrained (Case A: 1-token hop over c-1, or 2-token hop over
+        c-1 and c-2 if c-2 is blank/PAD; Case B: hop over c-2 and blank c-1, or 3-token hop over
+        leading blank c-3, c-2, and c-1 if c-3 is blank/PAD), preventing inadvertent skipping of
+        non-syncope consonants.
     :param is_optional_vowel: deprecated alias for is_syncope_token.
     :return: A tuple of (timings, char_probs, state_list):
         - timings: array of aligned character start times in seconds.
@@ -444,7 +451,7 @@ def ctc_segmentation(
                 est_stay_prob = table[t, c] - table[t - 1, c]
                 stay_prob_delta = abs(stay_prob - est_stay_prob)
 
-                # Check syncope skip transitions
+                # Check syncope skip transitions with blank constraints
                 min_syncope_skip_delta = np.inf
                 best_syncope_c_prev = None
                 best_syncope_s = None
@@ -452,7 +459,12 @@ def ctc_segmentation(
                     for s in range(ground_truth.shape[1]):
                         if ground_truth[c, s] != -1:
                             if is_syncope_token_arr[c - 1] == 1:
-                                for c_prev in range(max(0, c - 3), c - 1):
+                                # Valid candidate predecessors
+                                candidates = [c - 2]
+                                if c >= 3 and (ground_truth[c - 2, 0] == blank or ground_truth[c - 2, 0] == -1):
+                                    candidates.append(c - 3)
+
+                                for c_prev in candidates:
                                     delta_offset = offsets[c] - offsets[c_prev]
                                     t_prev = t - 1 + delta_offset
                                     if 0 <= t_prev < table.shape[0]:
@@ -474,7 +486,11 @@ def ctc_segmentation(
                                     or ground_truth[c - 1, 0] == -1
                                 )
                             ):
-                                for c_prev in range(max(0, c - 4), c - 2):
+                                candidates = [c - 3]
+                                if c >= 4 and (ground_truth[c - 3, 0] == blank or ground_truth[c - 3, 0] == -1):
+                                    candidates.append(c - 4)
+
+                                for c_prev in candidates:
                                     delta_offset = offsets[c] - offsets[c_prev]
                                     t_prev = t - 1 + delta_offset
                                     if 0 <= t_prev < table.shape[0]:

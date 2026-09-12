@@ -219,10 +219,36 @@ To account for preambles or unrelated segments in audio files, the transition co
 
 For languages with phonetic reductions or token syncope (e.g. Cherokee medial vowel syncope, unstressed sound deletion), sounds written in canonical text are often dropped in natural speech. Standard CTC segmentation forces alignment of every character, causing misalignments or requiring intractable $O(2^n)$ string expansions.
 
-To support syncope in $O(T \times S)$ polynomial time, the trellis evaluates an optional transition:
-* **Syncope-Skip ($\epsilon$-transition)**: If an intervening character state is marked as an optional syncope token (via `syncope_tokens` or `is_syncope_token`), the dynamic programming trellis can jump directly from the preceding state $c_{\text{prev}}$ to the next character state $c$:
-  $$\text{syncope\_skip\_prob} = \text{table}[t-1, c_{\text{prev}}] - \lambda_{\text{syncope}}$$
-  where $\lambda_{\text{syncope}} \ge 0$ is a configurable penalty (parameter `syncope_penalty`, default: `0.25`).
+To support syncope in $O(T \times S)$ polynomial time while strictly protecting non-syncope characters (such as preceding consonants) from accidental omission, the trellis evaluates blank-constrained syncope-skip transitions governed by two core invariants:
+
+1. **Consonant Preservation Invariant**: A syncope transition **MUST NOT** omit any character token whose `is_syncope_token == 0`.
+2. **Blank-Only Stride Invariant**: Multi-column skips across optional syncope tokens are valid **if and only if** any additional intermediate columns are CTC blank / PAD tokens ($L = \text{blank}$ or $L = -1$).
+
+##### Blank-Constrained Syncope Recurrence
+
+Let $\text{is\_syncope\_token}[c] \in \{0, 1\}$ indicate if column $c$ is marked as an eligible syncope token, and $\lambda_{\text{syncope}} \ge 0$ be the configurable syncope penalty (`syncope_penalty`, default: `0.25`). For any arrival state $(t, c)$ with label $L(c, s) \ne -1$:
+
+* **Case A: Immediate Syncope Vowel ($c - 1$ is syncope token)**
+  1. *Direct 1-token skip ($c - 2 \to c$):*
+     $$P_{\text{sync}, 1}(t, c) = \text{table}[t - 1 + \text{offset}(c, c - 2), c - 2] + \text{lpz}[t + \text{offset\_sum}, L(c, s)] - \lambda_{\text{syncope}}$$
+  2. *Blank-mediated 2-token skip ($c - 3 \to c$):*
+     Permitted **only if** $c \ge 3$ and state $c - 2$ is a CTC blank/PAD token ($L(c - 2, 0) \in \{\text{blank}, -1\}$):
+     $$P_{\text{sync}, 2}(t, c) = \begin{cases}
+     \text{table}[t - 1 + \text{offset}(c, c - 3), c - 3] + \text{lpz}[t + \text{offset\_sum}, L(c, s)] - \lambda_{\text{syncope}} & \text{if } L(c - 2, 0) \in \{\text{blank}, -1\} \\
+     -\infty & \text{otherwise}
+     \end{cases}$$
+     *(If $c - 2$ is a consonant or other non-syncope character, $c - 3 \to c$ is forbidden, enforcing consonant preservation.)*
+
+* **Case B: Space/Blank Following Syncope Vowel ($c - 2$ is syncope token and $c - 1$ is blank)**
+  1. *Skip vowel + trailing blank ($c - 3 \to c$):*
+     $$P_{\text{sync}, 3}(t, c) = \text{table}[t - 1 + \text{offset}(c, c - 3), c - 3] + \text{lpz}[t + \text{offset\_sum}, L(c, s)] - \lambda_{\text{syncope}}$$
+  2. *Skip leading blank + vowel + trailing blank ($c - 4 \to c$):*
+     Permitted **only if** $c \ge 4$ and state $c - 3$ is a CTC blank/PAD token ($L(c - 3, 0) \in \{\text{blank}, -1\}$):
+     $$P_{\text{sync}, 4}(t, c) = \begin{cases}
+     \text{table}[t - 1 + \text{offset}(c, c - 4), c - 4] + \text{lpz}[t + \text{offset\_sum}, L(c, s)] - \lambda_{\text{syncope}} & \text{if } L(c - 3, 0) \in \{\text{blank}, -1\} \\
+     -\infty & \text{otherwise}
+     \end{cases}$$
+     *(If $c - 3$ is a consonant or other non-syncope character, $c - 4 \to c$ is forbidden, preserving the preceding consonant.)*
 
 #### Intrusive Token Transitions (Blank-Tolerant Detours)
 
