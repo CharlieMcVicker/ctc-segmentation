@@ -17,6 +17,7 @@ https://arxiv.org/abs/2007.09127 or
 https://link.springer.com/chapter/10.1007%2F978-3-030-60276-5_27
 """
 
+from dataclasses import dataclass
 import logging
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 import warnings
@@ -61,17 +62,24 @@ class CtcSegmentationParameters:
         start_of_ground_truth: Symbol indicating start of ground truth sequence (default: "#").
         excluded_characters: String of punctuation characters excluded during text preparation.
         tokenized_meta_symbol: SentencePiece/BPE prefix symbol (default: "▁").
-        char_list: Vocabulary list or mapping of character tokens.
+        char_list: Vocabulary list or mapping of character tokens (default: None).
         syncope_penalty: Log-space penalty subtracted for syncope skip transitions (default: 0.25).
-        syncope_tokens: Sequence of tokens (strings or integer IDs) that can be skipped via syncope.
-        is_syncope_token: 1D mask marking syncope token positions in ground truth for
-            blank-constrained syncope transitions. Enforces the Consonant Preservation Invariant
+        syncope_tokens: Sequence of tokens (strings or integer IDs) that can be skipped via syncope (default: None).
+        is_syncope_token: Optional sequence or 1D mask marking syncope token positions in ground truth for
+            blank-constrained syncope transitions (default: None). Enforces the Consonant Preservation Invariant
             and Blank-Only Stride Invariants (Case A and Case B).
         intrusive_tokens: Sequence of tokens (strings or integer IDs) permitted as intrusive acoustic
-            detours between ground-truth label transitions (e.g. epenthesis, aspiration, glottal stops).
-        intrusive_penalty: Log-space penalty subtracted from intrusive detour transitions (default: 0.1).
+            detours between ground-truth label transitions (e.g. epenthesis, aspiration, glottal stops) (default: None).
+        intrusive_penalty: Default log-space penalty subtracted from intrusive detour transitions (default: 0.1).
+        intrusive_penalties: Uniform float penalty or per-token dictionary (e.g. `{"h": 0.15, "'": 0.3}`) mapping
+            token strings or integer IDs to individual transition penalties (default: None).
+        intrusive_min_logprobs: Uniform float or per-token dictionary (e.g. `{"h": -1.2, "'": -0.7}`) specifying
+            minimum log-probability thresholds (or linear probabilities in (0, 1]) gating intrusive candidate
+            evaluation to filter diffuse noise while retaining sharp transient events (default: None).
         intrusive_max_stride: Maximum blank frame stride permitted for blank-tolerant intrusive transitions (default: 4).
-        is_intrusive_token: 1D mask across vocabulary indices marking eligible intrusive tokens.
+        is_intrusive_site: Optional sequence or 1D mask of size len(ground_truth) restricting intrusive detour
+            transitions strictly to licensed ground-truth positions (default: None).
+        is_intrusive_token: 1D mask across vocabulary indices marking eligible intrusive tokens (default: None).
     """
 
     max_prob: float = -10000000000.0
@@ -93,11 +101,14 @@ class CtcSegmentationParameters:
     char_list: Optional[Union[List[str], Tuple[str, ...], Set[str], Sequence[str]]] = None
     syncope_penalty: float = 0.25
     syncope_tokens: Optional[Sequence[Union[str, int]]] = None
-    is_syncope_token: Optional[np.ndarray] = None
+    is_syncope_token: Optional[Union[Sequence[Union[bool, int]], np.ndarray]] = None
     # Intrusive Token Subsystem
     intrusive_tokens: Optional[Sequence[Union[str, int]]] = None
     intrusive_penalty: float = 0.1
+    intrusive_penalties: Optional[Union[float, Dict[Union[str, int], float]]] = None
+    intrusive_min_logprobs: Optional[Union[float, Dict[Union[str, int], float]]] = None
     _intrusive_max_stride: int = 4
+    is_intrusive_site: Optional[Union[Sequence[Union[bool, int]], np.ndarray]] = None
     is_intrusive_token: Optional[np.ndarray] = None
     # legacy Parameters (deprecated, use index_duration instead)
     _subsampling_factor: Optional[Union[int, float]] = None
@@ -323,6 +334,299 @@ class CtcSegmentationParameters:
         return output
 
 
+def _parse_intrusive_token_ids(
+    tokens: Optional[Sequence[Union[str, int]]],
+    char_list: Optional[Union[List[str], Tuple[str, ...], Set[str], Sequence[str]]] = None,
+) -> List[int]:
+    """Parse and validate intrusive token specifications (strings or integer IDs)."""
+    if tokens is None:
+        return []
+    c_list = list(char_list) if char_list is not None else None
+    token_ids = []
+    for t_item in tokens:
+        if isinstance(t_item, str):
+            if c_list is not None and t_item in c_list:
+                token_ids.append(c_list.index(t_item))
+            else:
+                raise ValueError(f"Intrusive token '{t_item}' not found in char_list")
+        elif isinstance(t_item, (int, np.integer)) and not isinstance(t_item, bool):
+            t_int = int(t_item)
+            if c_list is not None and not (0 <= t_int < len(c_list)):
+                raise ValueError(
+                    f"Intrusive token id {t_int} out of range for char_list of length {len(c_list)}"
+                )
+            if t_int < 0:
+                raise ValueError(
+                    f"Intrusive token id must be non-negative, got {t_int}"
+                )
+            token_ids.append(t_int)
+        else:
+            raise TypeError(
+                f"Invalid intrusive token type: Unsupported intrusive token type: {type(t_item)}"
+            )
+    return token_ids
+
+
+def _create_intrusive_mask(
+    config: CtcSegmentationParameters,
+    char_list: Optional[Sequence[str]] = None,
+) -> Optional[np.ndarray]:
+    """Create a 1D int8 mask indicating intrusive token indices in vocabulary (char_list)."""
+    c_list = char_list if char_list is not None else config.char_list
+    if config.intrusive_tokens is None or c_list is None:
+        return None
+    ids = _parse_intrusive_token_ids(config.intrusive_tokens, c_list)
+    mask = np.zeros(len(c_list), dtype=np.int8)
+    for idx in ids:
+        mask[idx] = 1
+    return mask
+
+
+def _get_intrusive_token_ids(
+    config: CtcSegmentationParameters,
+) -> np.ndarray:
+    """Extract and validate intrusive token IDs from configuration."""
+    if config.intrusive_tokens is not None:
+        token_ids = _parse_intrusive_token_ids(
+            config.intrusive_tokens, config.char_list
+        )
+        return np.array(token_ids, dtype=np.int64)
+    elif config.is_intrusive_token is not None:
+        return np.where(
+            np.asarray(config.is_intrusive_token, dtype=np.int8) == 1
+        )[0].astype(np.int64)
+    return np.zeros(0, dtype=np.int64)
+
+
+def _create_syncope_mask(
+    config: CtcSegmentationParameters,
+    ground_truth: Union[Sequence[Any], np.ndarray],
+    is_token_ids: bool = False,
+) -> np.ndarray:
+    """Create a 1D int8 mask indicating syncope token positions in ground_truth."""
+    mask = np.zeros(len(ground_truth), dtype=np.int8)
+    tokens = config.syncope_tokens
+    if tokens is None:
+        return mask
+    syncope_set = set(tokens)
+    for idx, item in enumerate(ground_truth):
+        if is_token_ids:
+            if item in syncope_set:
+                mask[idx] = 1
+            elif (
+                config.char_list is not None
+                and isinstance(item, (int, np.integer))
+                and 0 <= item < len(config.char_list)
+                and config.char_list[item] in syncope_set
+            ):
+                mask[idx] = 1
+        else:
+            if item in syncope_set:
+                mask[idx] = 1
+            elif (
+                config.char_list is not None
+                and item in config.char_list
+                and config.char_list.index(item) in syncope_set
+            ):
+                mask[idx] = 1
+    return mask
+
+
+def _create_optional_vowel_mask(
+    config: CtcSegmentationParameters,
+    ground_truth: Union[Sequence[Any], np.ndarray],
+    is_token_ids: bool = False,
+) -> np.ndarray:
+    """Deprecated alias for _create_syncope_mask."""
+    warnings.warn(
+        "_create_optional_vowel_mask is deprecated and will be removed in a future version. "
+        "Use _create_syncope_mask instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return _create_syncope_mask(config, ground_truth, is_token_ids=is_token_ids)
+
+
+@dataclass(frozen=True)
+class TrellisRuntimeContext:
+    """Internal compiled runtime context passed to Cython core and backtracking.
+
+    Maintains the architectural separation between the high-level, human-friendly
+    `CtcSegmentationParameters` userspace configuration object and the low-level,
+    C-contiguous NumPy arrays required for zero-overhead Cython DP trellis filling
+    and backtracking.
+
+    Attributes:
+        is_syncope_token: 1D `int8` array of shape `(L,)` indicating which ground-truth
+            states are eligible for blank-constrained syncope skip transitions.
+        syncope_penalty: Float log-space penalty subtracted when taking a syncope skip.
+        intrusive_token_ids: 1D `int64` array of shape `(K,)` with vocabulary token IDs
+            of eligible intrusive detour tokens.
+        intrusive_penalties: 1D `float32` array of shape `(K,)` with per-token log-space
+            transition penalties subtracted when taking an intrusive detour.
+        intrusive_min_logprobs: 1D `float32` array of shape `(K,)` with per-token minimum
+            log-probability thresholds gating intrusive candidate evaluation.
+        is_intrusive_site: 1D `int8` array of shape `(L,)` (or empty if unrestricted)
+            restricting intrusive detour arrival states to licensed ground-truth positions.
+        intrusive_max_stride: Integer maximum blank frame stride bridging intrusive tokens.
+        blank: Integer vocabulary index of the CTC blank / PAD token.
+        flags: Packed integer bitmask of runtime configuration flags.
+    """
+
+    # Ground truth & syncope arrays
+    is_syncope_token: np.ndarray  # 1D np.int8 array of shape (L,)
+    syncope_penalty: float
+
+    # Intrusive detour arrays
+    intrusive_token_ids: np.ndarray  # 1D np.int64 array of shape (K,)
+    intrusive_penalties: np.ndarray  # 1D np.float32 array of shape (K,)
+    intrusive_min_logprobs: np.ndarray  # 1D np.float32 array of shape (K,)
+    is_intrusive_site: np.ndarray  # 1D np.int8 array of shape (L,)
+    intrusive_max_stride: int
+
+    blank: int
+    flags: int
+
+    @classmethod
+    def compile(
+        cls,
+        config: CtcSegmentationParameters,
+        ground_truth: np.ndarray,
+        is_syncope_token: Optional[Union[Sequence[Union[bool, int]], np.ndarray]] = None,
+    ) -> "TrellisRuntimeContext":
+        """Compile and validate user configuration into C-contiguous NumPy runtime arrays.
+
+        Validates all user-specified syncope and intrusive token configurations,
+        resolves token strings against `char_list`, normalizes linear probabilities
+        in (0, 1] to log-space thresholds, and builds contiguous arrays ready for
+        the Cython core.
+
+        Args:
+            config: An instance of `CtcSegmentationParameters`.
+            ground_truth: 2D label matrix of shape `(L, max_char_len)`.
+            is_syncope_token: Optional sequence or 1D mask override for syncope tokens.
+
+        Returns:
+            An immutable `TrellisRuntimeContext` instance containing compiled arrays.
+
+        Raises:
+            ValueError: If mask lengths do not match ground truth length, or token
+                strings are not present in `char_list`.
+            TypeError: If configuration parameters have invalid types.
+        """
+        num_cols = ground_truth.shape[0]
+
+        # 1. Compile syncope mask
+        syncope_input = (
+            is_syncope_token if is_syncope_token is not None else config.is_syncope_token
+        )
+        if syncope_input is not None:
+            syncope_mask = np.ascontiguousarray(syncope_input, dtype=np.int8)
+            if syncope_mask.ndim != 1 or syncope_mask.shape[0] != num_cols:
+                raise ValueError(
+                    f"is_syncope_token length ({syncope_mask.shape[0]}) does not match "
+                    f"ground_truth length ({num_cols})"
+                )
+        else:
+            syncope_mask = np.zeros((0,), dtype=np.int8)
+
+        # 2. Compile intrusive token IDs
+        intrusive_token_ids = np.ascontiguousarray(
+            _get_intrusive_token_ids(config), dtype=np.int64
+        )
+        K = len(intrusive_token_ids)
+
+        # 3. Compile per-token penalties
+        penalties_arr = np.zeros(K, dtype=np.float32)
+        default_penalty = float(getattr(config, "intrusive_penalty", 0.1))
+        if K > 0:
+            if config.intrusive_penalties is None:
+                penalties_arr.fill(default_penalty)
+            elif isinstance(config.intrusive_penalties, (int, float, np.floating)) and not isinstance(
+                config.intrusive_penalties, bool
+            ):
+                penalties_arr.fill(float(config.intrusive_penalties))
+            elif isinstance(config.intrusive_penalties, dict):
+                char_list_seq = (
+                    list(config.char_list)
+                    if config.char_list is not None
+                    else None
+                )
+                for idx, t_id in enumerate(intrusive_token_ids):
+                    t_str = (
+                        char_list_seq[t_id]
+                        if char_list_seq and 0 <= t_id < len(char_list_seq)
+                        else None
+                    )
+                    if t_id in config.intrusive_penalties:
+                        penalties_arr[idx] = float(config.intrusive_penalties[t_id])
+                    elif t_str is not None and t_str in config.intrusive_penalties:
+                        penalties_arr[idx] = float(config.intrusive_penalties[t_str])
+                    else:
+                        penalties_arr[idx] = default_penalty
+            else:
+                raise TypeError(
+                    f"Invalid intrusive_penalties type: {type(config.intrusive_penalties)}"
+                )
+
+        # 4. Compile per-token min log-probability thresholds
+        min_lpz_arr = np.full(K, -np.inf, dtype=np.float32)
+        if K > 0 and config.intrusive_min_logprobs is not None:
+            if isinstance(config.intrusive_min_logprobs, (int, float, np.floating)) and not isinstance(
+                config.intrusive_min_logprobs, bool
+            ):
+                val = float(config.intrusive_min_logprobs)
+                log_val = np.log(val) if 0.0 < val <= 1.0 else val
+                min_lpz_arr.fill(log_val)
+            elif isinstance(config.intrusive_min_logprobs, dict):
+                char_list_seq = (
+                    list(config.char_list)
+                    if config.char_list is not None
+                    else None
+                )
+                for idx, t_id in enumerate(intrusive_token_ids):
+                    t_str = (
+                        char_list_seq[t_id]
+                        if char_list_seq and 0 <= t_id < len(char_list_seq)
+                        else None
+                    )
+                    val = None
+                    if t_id in config.intrusive_min_logprobs:
+                        val = config.intrusive_min_logprobs[t_id]
+                    elif t_str is not None and t_str in config.intrusive_min_logprobs:
+                        val = config.intrusive_min_logprobs[t_str]
+                    if val is not None:
+                        val = float(val)
+                        min_lpz_arr[idx] = np.log(val) if 0.0 < val <= 1.0 else val
+            else:
+                raise TypeError(
+                    f"Invalid intrusive_min_logprobs type: {type(config.intrusive_min_logprobs)}"
+                )
+
+        # 5. Compile intrusive site mask
+        if config.is_intrusive_site is not None:
+            site_mask = np.ascontiguousarray(config.is_intrusive_site, dtype=np.int8)
+            if site_mask.ndim != 1 or site_mask.shape[0] != num_cols:
+                raise ValueError(
+                    f"is_intrusive_site length ({site_mask.shape[0]}) does not match "
+                    f"ground_truth length ({num_cols})"
+                )
+        else:
+            site_mask = np.zeros((0,), dtype=np.int8)
+
+        return cls(
+            is_syncope_token=syncope_mask,
+            syncope_penalty=float(config.syncope_penalty),
+            intrusive_token_ids=intrusive_token_ids,
+            intrusive_penalties=penalties_arr,
+            intrusive_min_logprobs=min_lpz_arr,
+            is_intrusive_site=site_mask,
+            intrusive_max_stride=int(config.intrusive_max_stride),
+            blank=int(config.blank),
+            flags=int(config.flags),
+        )
+
+
 def ctc_segmentation(
     config: CtcSegmentationParameters,
     lpz: np.ndarray,
@@ -335,24 +639,31 @@ def ctc_segmentation(
     Aligns CTC posterior probabilities `lpz` with ground-truth label matrix
     `ground_truth`. Supports blank-constrained syncope-skip transitions (for optional
     token omission while strictly enforcing the Consonant Preservation Invariant and
-    Blank-Only Stride Invariants across blank/PAD states) and intrusive detour transitions
-    (for acoustic surface token insertions like aspiration, epenthesis, or glottal stops).
+    Blank-Only Stride Invariants across blank/PAD states) and blank-tolerant intrusive
+    detour transitions (for acoustic surface token insertions like aspiration, epenthesis,
+    or glottal stops with per-token transition penalties, minimum log-probability threshold
+    gating, and phonotactic site masking).
 
-    :param config: an instance of CtcSegmentationParameters configuring trellis alignment,
-        windowing, syncope penalties, and intrusive detour parameters.
-    :param lpz: log-probabilities obtained from CTC output (shape: [time_frames, vocab_size]).
-    :param ground_truth: ground truth label matrix (shape: [labels_len, max_char_len]).
-    :param is_syncope_token: optional 1D mask marking optional syncope token positions.
-        Syncope skips are blank-constrained (Case A: 1-token hop over c-1, or 2-token hop over
-        c-1 and c-2 if c-2 is blank/PAD; Case B: hop over c-2 and blank c-1, or 3-token hop over
-        leading blank c-3, c-2, and c-1 if c-3 is blank/PAD), preventing inadvertent skipping of
-        non-syncope consonants.
-    :param is_optional_vowel: deprecated alias for is_syncope_token.
-    :return: A tuple of (timings, char_probs, state_list):
-        - timings: array of aligned character start times in seconds.
-        - char_probs: array of character/token probabilities aligned from backtracking.
-        - state_list: list of aligned tokens (including ground-truth tokens, intrusive tokens,
-          and self-transitions).
+    Args:
+        config: An instance of `CtcSegmentationParameters` configuring trellis alignment,
+            windowing, syncope penalties, intrusive token penalties, min-logprob gating,
+            and stride tolerances.
+        lpz: Log-probabilities obtained from CTC output of shape `(time_frames, vocab_size)`.
+        ground_truth: Ground truth label matrix of shape `(labels_len, max_char_len)`.
+        is_syncope_token: Optional 1D mask marking optional syncope token positions in
+            ground truth for blank-constrained syncope skips.
+        is_optional_vowel: Deprecated alias for `is_syncope_token`.
+
+    Returns:
+        A tuple of `(timings, char_probs, state_list)`:
+            - timings: 1D array of shape `(labels_len,)` with aligned character start times in seconds.
+            - char_probs: 1D array of shape `(time_frames,)` with frame-wise aligned log probabilities.
+            - state_list: List of strings of length `time_frames` with aligned character/token symbols
+              (including ground truth tokens, intrusive tokens, and stay/self transitions).
+
+    Raises:
+        AssertionError: If audio is shorter than text or alignment fails.
+        ValueError: If configuration parameters or mask dimensions are invalid.
     """
     if is_syncope_token is None and is_optional_vowel is not None:
         warnings.warn(
@@ -373,21 +684,10 @@ def ctc_segmentation(
     )
     if len(ground_truth) > lpz.shape[0] and config.skip_prob <= config.max_prob:
         raise AssertionError("Audio is shorter than text!")
-    if is_syncope_token is None:
-        mask = getattr(config, "is_syncope_token", None)
-        if mask is not None and len(mask) == len(ground_truth):
-            is_syncope_token_arr = mask
-        else:
-            is_syncope_token_arr = np.zeros(len(ground_truth), dtype=np.int8)
-    else:
-        is_syncope_token_arr = np.asarray(is_syncope_token, dtype=np.int8)
 
-    syncope_penalty = float(getattr(config, "syncope_penalty", 0.25))
-
-    intrusive_token_ids = _get_intrusive_token_ids(config)
-    num_intrusive_tokens = len(intrusive_token_ids)
-    intrusive_penalty = float(getattr(config, "intrusive_penalty", 0.1))
-    intrusive_max_stride = int(getattr(config, "intrusive_max_stride", 4))
+    runtime_ctx = TrellisRuntimeContext.compile(
+        config, ground_truth, is_syncope_token=is_syncope_token
+    )
 
     window_size = config.min_window_size
     # Try multiple window lengths if it fails
@@ -405,13 +705,15 @@ def ctc_segmentation(
             lpz.astype(np.float32),
             np.array(ground_truth, dtype=np.int64),
             offsets,
-            is_syncope_token_arr,
-            syncope_penalty,
-            intrusive_token_ids,
-            intrusive_penalty,
-            intrusive_max_stride,
-            config.blank,
-            config.flags,
+            runtime_ctx.is_syncope_token,
+            runtime_ctx.syncope_penalty,
+            runtime_ctx.intrusive_token_ids,
+            runtime_ctx.intrusive_penalties,
+            runtime_ctx.intrusive_min_logprobs,
+            runtime_ctx.is_intrusive_site,
+            runtime_ctx.intrusive_max_stride,
+            runtime_ctx.blank,
+            runtime_ctx.flags,
         )
         if config.backtrack_from_max_t:
             t = table.shape[0] - 1
@@ -455,10 +757,10 @@ def ctc_segmentation(
                 min_syncope_skip_delta = np.inf
                 best_syncope_c_prev = None
                 best_syncope_s = None
-                if c >= 2:
+                if runtime_ctx.is_syncope_token.shape[0] > 0 and c >= 2:
                     for s in range(ground_truth.shape[1]):
                         if ground_truth[c, s] != -1:
-                            if is_syncope_token_arr[c - 1] == 1:
+                            if runtime_ctx.is_syncope_token[c - 1] == 1:
                                 # Valid candidate predecessors
                                 candidates = [c - 2]
                                 if c >= 3 and (ground_truth[c - 2, 0] == blank or ground_truth[c - 2, 0] == -1):
@@ -471,7 +773,7 @@ def ctc_segmentation(
                                         est_v_prob = table[t, c] - table[t_prev, c_prev]
                                         expected_v_prob = (
                                             lpz[t + offsets[c], ground_truth[c, s]]
-                                            - syncope_penalty
+                                            - runtime_ctx.syncope_penalty
                                         )
                                         v_delta = abs(est_v_prob - expected_v_prob)
                                         if v_delta < min_syncope_skip_delta:
@@ -480,7 +782,7 @@ def ctc_segmentation(
                                             best_syncope_s = s
                             elif (
                                 c >= 3
-                                and is_syncope_token_arr[c - 2] == 1
+                                and runtime_ctx.is_syncope_token[c - 2] == 1
                                 and (
                                     ground_truth[c - 1, 0] == blank
                                     or ground_truth[c - 1, 0] == -1
@@ -497,7 +799,7 @@ def ctc_segmentation(
                                         est_v_prob = table[t, c] - table[t_prev, c_prev]
                                         expected_v_prob = (
                                             lpz[t + offsets[c], ground_truth[c, s]]
-                                            - syncope_penalty
+                                            - runtime_ctx.syncope_penalty
                                         )
                                         v_delta = abs(est_v_prob - expected_v_prob)
                                         if v_delta < min_syncope_skip_delta:
@@ -510,22 +812,29 @@ def ctc_segmentation(
                 best_intrusive_j = None
                 best_intrusive_s = None
                 best_intrusive_stride = 0
-                if c >= 1 and t >= 2 and num_intrusive_tokens > 0:
+                if (
+                    c >= 1
+                    and t >= 2
+                    and len(runtime_ctx.intrusive_token_ids) > 0
+                    and (runtime_ctx.is_intrusive_site.shape[0] == 0 or runtime_ctx.is_intrusive_site[c] == 1)
+                ):
                     for s in range(ground_truth.shape[1]):
                         if ground_truth[c, s] == -1 or c - 1 - s < 0:
                             continue
                         offset = offsets[c] - offsets[c - 1 - s]
-                        for delta in range(0, min(intrusive_max_stride + 1, t - 1)):
-                                t_prev = t - 2 - delta + offset
-                                if 0 <= t_prev < table.shape[0]:
-                                    blank_sum = 0.0
-                                    for b_t in range(t - delta, t):
-                                        blank_sum += lpz[b_t + offsets[c], blank]
-                                    for j in intrusive_token_ids:
+                        for delta in range(0, min(runtime_ctx.intrusive_max_stride + 1, t - 1)):
+                            t_prev = t - 2 - delta + offset
+                            if 0 <= t_prev < table.shape[0]:
+                                blank_sum = 0.0
+                                for b_t in range(t - delta, t):
+                                    blank_sum += lpz[b_t + offsets[c], blank]
+                                for j_idx, j in enumerate(runtime_ctx.intrusive_token_ids):
+                                    t_detour_frame = t - 1 - delta + offsets[c]
+                                    if lpz[t_detour_frame, j] >= runtime_ctx.intrusive_min_logprobs[j_idx]:
                                         expected_p = (
                                             table[t_prev, c - 1 - s]
-                                            + lpz[t - 1 - delta + offsets[c], j]
-                                            - intrusive_penalty
+                                            + lpz[t_detour_frame, j]
+                                            - runtime_ctx.intrusive_penalties[j_idx]
                                             + blank_sum
                                             + lpz[t + offsets[c], ground_truth[c, s]]
                                         )
@@ -610,117 +919,6 @@ def ctc_segmentation(
             continue
         break
     return timings, char_probs, state_list
-
-
-def _create_syncope_mask(
-    config: CtcSegmentationParameters,
-    ground_truth: Union[Sequence[Any], np.ndarray],
-    is_token_ids: bool = False,
-) -> np.ndarray:
-    """Create a 1D int8 mask indicating syncope token positions in ground_truth."""
-    mask = np.zeros(len(ground_truth), dtype=np.int8)
-    tokens = config.syncope_tokens
-    if tokens is None:
-        return mask
-    syncope_set = set(tokens)
-    for idx, item in enumerate(ground_truth):
-        if is_token_ids:
-            if item in syncope_set:
-                mask[idx] = 1
-            elif (
-                config.char_list is not None
-                and isinstance(item, (int, np.integer))
-                and 0 <= item < len(config.char_list)
-                and config.char_list[item] in syncope_set
-            ):
-                mask[idx] = 1
-        else:
-            if item in syncope_set:
-                mask[idx] = 1
-            elif (
-                config.char_list is not None
-                and item in config.char_list
-                and config.char_list.index(item) in syncope_set
-            ):
-                mask[idx] = 1
-    return mask
-
-
-def _create_optional_vowel_mask(
-    config: CtcSegmentationParameters,
-    ground_truth: Union[Sequence[Any], np.ndarray],
-    is_token_ids: bool = False,
-) -> np.ndarray:
-    """Deprecated alias for _create_syncope_mask."""
-    warnings.warn(
-        "_create_optional_vowel_mask is deprecated and will be removed in a future version. "
-        "Use _create_syncope_mask instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return _create_syncope_mask(config, ground_truth, is_token_ids=is_token_ids)
-
-
-def _parse_intrusive_token_ids(
-    tokens: Optional[Sequence[Union[str, int]]],
-    char_list: Optional[Union[List[str], Tuple[str, ...], Set[str], Sequence[str]]] = None,
-) -> List[int]:
-    """Parse and validate intrusive token specifications (strings or integer IDs)."""
-    if tokens is None:
-        return []
-    c_list = list(char_list) if char_list is not None else None
-    token_ids = []
-    for t_item in tokens:
-        if isinstance(t_item, str):
-            if c_list is not None and t_item in c_list:
-                token_ids.append(c_list.index(t_item))
-            else:
-                raise ValueError(f"Intrusive token '{t_item}' not found in char_list")
-        elif isinstance(t_item, (int, np.integer)):
-            t_int = int(t_item)
-            if c_list is not None and not (0 <= t_int < len(c_list)):
-                raise ValueError(
-                    f"Intrusive token id {t_int} out of range for char_list of length {len(c_list)}"
-                )
-            if t_int < 0:
-                raise ValueError(
-                    f"Intrusive token id must be non-negative, got {t_int}"
-                )
-            token_ids.append(t_int)
-        else:
-            raise TypeError(f"Unsupported intrusive token type: {type(t_item)}")
-    return token_ids
-
-
-def _create_intrusive_mask(
-    config: CtcSegmentationParameters,
-    char_list: Optional[Sequence[str]] = None,
-) -> Optional[np.ndarray]:
-    """Create a 1D int8 mask indicating intrusive token indices in vocabulary (char_list)."""
-    c_list = char_list if char_list is not None else config.char_list
-    if config.intrusive_tokens is None or c_list is None:
-        return None
-    ids = _parse_intrusive_token_ids(config.intrusive_tokens, c_list)
-    mask = np.zeros(len(c_list), dtype=np.int8)
-    for idx in ids:
-        mask[idx] = 1
-    return mask
-
-
-def _get_intrusive_token_ids(
-    config: CtcSegmentationParameters,
-) -> np.ndarray:
-    """Extract and validate intrusive token IDs from configuration."""
-    if config.intrusive_tokens is not None:
-        token_ids = _parse_intrusive_token_ids(
-            config.intrusive_tokens, config.char_list
-        )
-        return np.array(token_ids, dtype=np.int64)
-    elif config.is_intrusive_token is not None:
-        return np.where(
-            np.asarray(config.is_intrusive_token, dtype=np.int8) == 1
-        )[0].astype(np.int64)
-    return np.zeros(0, dtype=np.int64)
 
 
 def prepare_text(
