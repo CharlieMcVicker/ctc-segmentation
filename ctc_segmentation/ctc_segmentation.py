@@ -62,21 +62,24 @@ class CtcSegmentationParameters:
         start_of_ground_truth: Symbol indicating start of ground truth sequence (default: "#").
         excluded_characters: String of punctuation characters excluded during text preparation.
         tokenized_meta_symbol: SentencePiece/BPE prefix symbol (default: "▁").
-        char_list: Vocabulary list or mapping of character tokens.
+        char_list: Vocabulary list or mapping of character tokens (default: None).
         syncope_penalty: Log-space penalty subtracted for syncope skip transitions (default: 0.25).
-        syncope_tokens: Sequence of tokens (strings or integer IDs) that can be skipped via syncope.
+        syncope_tokens: Sequence of tokens (strings or integer IDs) that can be skipped via syncope (default: None).
         is_syncope_token: Optional sequence or 1D mask marking syncope token positions in ground truth for
-            blank-constrained syncope transitions. Enforces the Consonant Preservation Invariant
+            blank-constrained syncope transitions (default: None). Enforces the Consonant Preservation Invariant
             and Blank-Only Stride Invariants (Case A and Case B).
         intrusive_tokens: Sequence of tokens (strings or integer IDs) permitted as intrusive acoustic
-            detours between ground-truth label transitions (e.g. epenthesis, aspiration, glottal stops).
-        intrusive_penalty: Log-space penalty subtracted from intrusive detour transitions (default: 0.1).
-        intrusive_penalties: Uniform float penalty or per-token dictionary of penalties for intrusive detours.
-        intrusive_min_logprobs: Uniform float or per-token dictionary of posterior minimum log-probability
-            thresholds (or linear probabilities in (0, 1]) gating intrusive transitions.
+            detours between ground-truth label transitions (e.g. epenthesis, aspiration, glottal stops) (default: None).
+        intrusive_penalty: Default log-space penalty subtracted from intrusive detour transitions (default: 0.1).
+        intrusive_penalties: Uniform float penalty or per-token dictionary (e.g. `{"h": 0.15, "'": 0.3}`) mapping
+            token strings or integer IDs to individual transition penalties (default: None).
+        intrusive_min_logprobs: Uniform float or per-token dictionary (e.g. `{"h": -1.2, "'": -0.7}`) specifying
+            minimum log-probability thresholds (or linear probabilities in (0, 1]) gating intrusive candidate
+            evaluation to filter diffuse noise while retaining sharp transient events (default: None).
         intrusive_max_stride: Maximum blank frame stride permitted for blank-tolerant intrusive transitions (default: 4).
-        is_intrusive_site: Optional sequence or 1D mask of size len(ground_truth) gating detour transition sites.
-        is_intrusive_token: 1D mask across vocabulary indices marking eligible intrusive tokens.
+        is_intrusive_site: Optional sequence or 1D mask of size len(ground_truth) restricting intrusive detour
+            transitions strictly to licensed ground-truth positions (default: None).
+        is_intrusive_token: 1D mask across vocabulary indices marking eligible intrusive tokens (default: None).
     """
 
     max_prob: float = -10000000000.0
@@ -333,7 +336,29 @@ class CtcSegmentationParameters:
 
 @dataclass(frozen=True)
 class TrellisRuntimeContext:
-    """Internal compiled runtime context passed to Cython core and backtracking."""
+    """Internal compiled runtime context passed to Cython core and backtracking.
+
+    Maintains the architectural separation between the high-level, human-friendly
+    `CtcSegmentationParameters` userspace configuration object and the low-level,
+    C-contiguous NumPy arrays required for zero-overhead Cython DP trellis filling
+    and backtracking.
+
+    Attributes:
+        is_syncope_token: 1D `int8` array of shape `(L,)` indicating which ground-truth
+            states are eligible for blank-constrained syncope skip transitions.
+        syncope_penalty: Float log-space penalty subtracted when taking a syncope skip.
+        intrusive_token_ids: 1D `int64` array of shape `(K,)` with vocabulary token IDs
+            of eligible intrusive detour tokens.
+        intrusive_penalties: 1D `float32` array of shape `(K,)` with per-token log-space
+            transition penalties subtracted when taking an intrusive detour.
+        intrusive_min_logprobs: 1D `float32` array of shape `(K,)` with per-token minimum
+            log-probability thresholds gating intrusive candidate evaluation.
+        is_intrusive_site: 1D `int8` array of shape `(L,)` (or empty if unrestricted)
+            restricting intrusive detour arrival states to licensed ground-truth positions.
+        intrusive_max_stride: Integer maximum blank frame stride bridging intrusive tokens.
+        blank: Integer vocabulary index of the CTC blank / PAD token.
+        flags: Packed integer bitmask of runtime configuration flags.
+    """
 
     # Ground truth & syncope arrays
     is_syncope_token: np.ndarray  # 1D np.int8 array of shape (L,)
@@ -355,7 +380,25 @@ class TrellisRuntimeContext:
         config: CtcSegmentationParameters,
         ground_truth: np.ndarray,
     ) -> "TrellisRuntimeContext":
-        """Compile and validate user configuration into C-contiguous NumPy runtime arrays."""
+        """Compile and validate user configuration into C-contiguous NumPy runtime arrays.
+
+        Validates all user-specified syncope and intrusive token configurations,
+        resolves token strings against `char_list`, normalizes linear probabilities
+        in (0, 1] to log-space thresholds, and builds contiguous arrays ready for
+        the Cython core.
+
+        Args:
+            config: An instance of `CtcSegmentationParameters`.
+            ground_truth: 2D label matrix of shape `(L, max_char_len)`.
+
+        Returns:
+            An immutable `TrellisRuntimeContext` instance containing compiled arrays.
+
+        Raises:
+            ValueError: If mask lengths do not match ground truth length, or token
+                strings are not present in `char_list`.
+            TypeError: If configuration parameters have invalid types.
+        """
         num_cols = ground_truth.shape[0]
 
         # 1. Compile syncope mask
@@ -492,24 +535,31 @@ def ctc_segmentation(
     Aligns CTC posterior probabilities `lpz` with ground-truth label matrix
     `ground_truth`. Supports blank-constrained syncope-skip transitions (for optional
     token omission while strictly enforcing the Consonant Preservation Invariant and
-    Blank-Only Stride Invariants across blank/PAD states) and intrusive detour transitions
-    (for acoustic surface token insertions like aspiration, epenthesis, or glottal stops).
+    Blank-Only Stride Invariants across blank/PAD states) and blank-tolerant intrusive
+    detour transitions (for acoustic surface token insertions like aspiration, epenthesis,
+    or glottal stops with per-token transition penalties, minimum log-probability threshold
+    gating, and phonotactic site masking).
 
-    :param config: an instance of CtcSegmentationParameters configuring trellis alignment,
-        windowing, syncope penalties, and intrusive detour parameters.
-    :param lpz: log-probabilities obtained from CTC output (shape: [time_frames, vocab_size]).
-    :param ground_truth: ground truth label matrix (shape: [labels_len, max_char_len]).
-    :param is_syncope_token: optional 1D mask marking optional syncope token positions.
-        Syncope skips are blank-constrained (Case A: 1-token hop over c-1, or 2-token hop over
-        c-1 and c-2 if c-2 is blank/PAD; Case B: hop over c-2 and blank c-1, or 3-token hop over
-        leading blank c-3, c-2, and c-1 if c-3 is blank/PAD), preventing inadvertent skipping of
-        non-syncope consonants.
-    :param is_optional_vowel: deprecated alias for is_syncope_token.
-    :return: A tuple of (timings, char_probs, state_list):
-        - timings: array of aligned character start times in seconds.
-        - char_probs: array of character/token probabilities aligned from backtracking.
-        - state_list: list of aligned tokens (including ground-truth tokens, intrusive tokens,
-          and self-transitions).
+    Args:
+        config: An instance of `CtcSegmentationParameters` configuring trellis alignment,
+            windowing, syncope penalties, intrusive token penalties, min-logprob gating,
+            and stride tolerances.
+        lpz: Log-probabilities obtained from CTC output of shape `(time_frames, vocab_size)`.
+        ground_truth: Ground truth label matrix of shape `(labels_len, max_char_len)`.
+        is_syncope_token: Optional 1D mask marking optional syncope token positions in
+            ground truth for blank-constrained syncope skips.
+        is_optional_vowel: Deprecated alias for `is_syncope_token`.
+
+    Returns:
+        A tuple of `(timings, char_probs, state_list)`:
+            - timings: 1D array of shape `(labels_len,)` with aligned character start times in seconds.
+            - char_probs: 1D array of shape `(time_frames,)` with frame-wise aligned log probabilities.
+            - state_list: List of strings of length `time_frames` with aligned character/token symbols
+              (including ground truth tokens, intrusive tokens, and stay/self transitions).
+
+    Raises:
+        AssertionError: If audio is shorter than text or alignment fails.
+        ValueError: If configuration parameters or mask dimensions are invalid.
     """
     if is_syncope_token is None and is_optional_vowel is not None:
         warnings.warn(
