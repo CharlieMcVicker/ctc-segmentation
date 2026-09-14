@@ -115,7 +115,7 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
 
             # Compute syncope skip probability with blank-constrained stride
             syncope_skip_prob = prob_max
-            if c >= 2:
+            if is_syncope_token.shape[0] > 0 and c >= 2:
                 for s in range(ground_truth.shape[1]):
                     if ground_truth[c, s] != -1:
                         # Case A: c - 1 is a syncope token

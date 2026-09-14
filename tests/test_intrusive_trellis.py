@@ -947,3 +947,41 @@ def test_intrusive_per_token_penalties_end_to_end():
     assert "h" not in states_g
 
 
+def test_trellis_runtime_context_backtracking_compatibility():
+    """Verify ctc_segmentation backtracking with TrellisRuntimeContext and legacy configurations."""
+    word = "akeya"
+    char_list = ["•"] + sorted(list(set(word + "h")))
+    gt_mat, _ = prepare_text(CtcSegmentationParameters(char_list=char_list), [word], char_list)
+
+    spoken_chars = ["a", "k", "e", "y", "h", "a"]
+    lpz = make_emissions(spoken_chars, char_list, frames_per_char=1, blank_frames=2)
+
+    # 1. Legacy scalar intrusive_penalty configuration
+    config_scalar = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h"],
+        intrusive_penalty=0.15,
+        min_window_size=50,
+        score_min_mean_over_L=2,
+    )
+    ctx_scalar = TrellisRuntimeContext.compile(config_scalar, gt_mat)
+    assert np.isclose(ctx_scalar.intrusive_penalties[0], 0.15, atol=1e-5)
+    timings, probs, states = ctc_segmentation(config_scalar, lpz, gt_mat)
+    assert "h" in states
+    assert len(timings) == len(gt_mat)
+
+    # 2. Legacy is_optional_vowel parameter passed into ctc_segmentation()
+    config_syncope = CtcSegmentationParameters(
+        char_list=char_list,
+        min_window_size=50,
+        score_min_mean_over_L=2,
+    )
+    vowel_mask = np.zeros(len(gt_mat), dtype=np.int8)
+    vowel_mask[2] = 1  # 'a'
+    with pytest.deprecated_call():
+        timings_v, probs_v, states_v = ctc_segmentation(
+            config_syncope, lpz, gt_mat, is_optional_vowel=vowel_mask
+        )
+    assert len(timings_v) == len(gt_mat)
+
+

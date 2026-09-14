@@ -520,6 +520,9 @@ def ctc_segmentation(
         )
         is_syncope_token = is_optional_vowel
 
+    if is_syncope_token is not None:
+        config.is_syncope_token = is_syncope_token
+
     blank = config.blank
     offset = 0
     audio_duration = lpz.shape[0] * config.index_duration
@@ -530,16 +533,7 @@ def ctc_segmentation(
     )
     if len(ground_truth) > lpz.shape[0] and config.skip_prob <= config.max_prob:
         raise AssertionError("Audio is shorter than text!")
-    if is_syncope_token is None:
-        mask = getattr(config, "is_syncope_token", None)
-        if mask is not None and len(mask) == len(ground_truth):
-            is_syncope_token_arr = mask
-        else:
-            is_syncope_token_arr = np.zeros(len(ground_truth), dtype=np.int8)
-    else:
-        is_syncope_token_arr = np.asarray(is_syncope_token, dtype=np.int8)
 
-    config.is_syncope_token = is_syncope_token_arr
     runtime_ctx = TrellisRuntimeContext.compile(config, ground_truth)
 
     window_size = config.min_window_size
@@ -610,10 +604,10 @@ def ctc_segmentation(
                 min_syncope_skip_delta = np.inf
                 best_syncope_c_prev = None
                 best_syncope_s = None
-                if c >= 2:
+                if runtime_ctx.is_syncope_token.shape[0] > 0 and c >= 2:
                     for s in range(ground_truth.shape[1]):
                         if ground_truth[c, s] != -1:
-                            if is_syncope_token_arr[c - 1] == 1:
+                            if runtime_ctx.is_syncope_token[c - 1] == 1:
                                 # Valid candidate predecessors
                                 candidates = [c - 2]
                                 if c >= 3 and (ground_truth[c - 2, 0] == blank or ground_truth[c - 2, 0] == -1):
@@ -635,7 +629,7 @@ def ctc_segmentation(
                                             best_syncope_s = s
                             elif (
                                 c >= 3
-                                and is_syncope_token_arr[c - 2] == 1
+                                and runtime_ctx.is_syncope_token[c - 2] == 1
                                 and (
                                     ground_truth[c - 1, 0] == blank
                                     or ground_truth[c - 1, 0] == -1
