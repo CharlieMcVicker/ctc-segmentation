@@ -8,6 +8,7 @@ import pytest
 
 from ctc_segmentation import (
     CtcSegmentationParameters,
+    TrellisRuntimeContext,
     ctc_segmentation,
     determine_utterance_segments,
     prepare_text,
@@ -471,9 +472,195 @@ def test_clean_speech_with_blanks_no_spurious_intrusions():
 
     for ch in ["a", "k", "e", "y"]:
         assert ch in states
-
     segments = determine_utterance_segments(config, utt_indices, char_probs, timings, [word])
     assert segments[0][2] > -1.0
 
 
+def test_trellis_runtime_context_compile_prob_conversion():
+    """Test TrellisRuntimeContext.compile linear-to-logprob conversion and raw logprob preservation."""
+    char_list = ["•", "a", "k", "e", "y", "h", "'"]
+    ground_truth = np.zeros((10, 2), dtype=np.int64)
 
+    # 1. Uniform linear probability in (0, 1] converted to log-probability
+    config = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h", "'"],
+        intrusive_min_logprobs=0.40,
+    )
+    ctx = TrellisRuntimeContext.compile(config, ground_truth)
+    assert np.allclose(ctx.intrusive_min_logprobs, np.log(0.40), atol=1e-5)
+    assert ctx.intrusive_min_logprobs.dtype == np.float32
+    assert ctx.intrusive_min_logprobs.flags.c_contiguous
+
+    # 2. Raw log-probability (<= 0) preserved as-is
+    config_raw = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h", "'"],
+        intrusive_min_logprobs=-1.5,
+    )
+    ctx_raw = TrellisRuntimeContext.compile(config_raw, ground_truth)
+    assert np.allclose(ctx_raw.intrusive_min_logprobs, -1.5, atol=1e-5)
+
+    # 3. Edge case: 1.0 converts to ln(1.0) == 0.0
+    config_one = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h"],
+        intrusive_min_logprobs=1.0,
+    )
+    ctx_one = TrellisRuntimeContext.compile(config_one, ground_truth)
+    assert np.isclose(ctx_one.intrusive_min_logprobs[0], 0.0, atol=1e-5)
+
+
+def test_trellis_runtime_context_compile_dict_lookup():
+    """Test TrellisRuntimeContext.compile dictionary mapping and token ID resolution."""
+    char_list = ["•", "a", "k", "e", "y", "h", "'"]
+    ground_truth = np.zeros((8, 2), dtype=np.int64)
+
+    # h is index 5, ' is index 6
+    config = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h", "'", 2],  # mixed token strings and integer token ID
+        intrusive_penalties={"h": 1.2, "'": 0.5, 2: 0.8},
+        intrusive_min_logprobs={"h": 0.40, "'": -1.5, 2: 0.25},
+    )
+    ctx = TrellisRuntimeContext.compile(config, ground_truth)
+
+    assert np.array_equal(ctx.intrusive_token_ids, np.array([5, 6, 2], dtype=np.int64))
+    assert ctx.intrusive_token_ids.flags.c_contiguous
+
+    assert np.allclose(ctx.intrusive_penalties, np.array([1.2, 0.5, 0.8], dtype=np.float32))
+    assert ctx.intrusive_penalties.flags.c_contiguous
+
+    expected_min_logprobs = np.array([np.log(0.40), -1.5, np.log(0.25)], dtype=np.float32)
+    assert np.allclose(ctx.intrusive_min_logprobs, expected_min_logprobs, atol=1e-5)
+    assert ctx.intrusive_min_logprobs.flags.c_contiguous
+
+    # Partial dict mapping: unmapped tokens get default penalty and -np.inf threshold
+    config_partial = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h", "'"],
+        intrusive_penalty=0.3,
+        intrusive_penalties={"h": 1.0},
+        intrusive_min_logprobs={"h": 0.50},
+    )
+    ctx_partial = TrellisRuntimeContext.compile(config_partial, ground_truth)
+    assert np.isclose(ctx_partial.intrusive_penalties[0], 1.0)
+    assert np.isclose(ctx_partial.intrusive_penalties[1], 0.3)
+    assert np.isclose(ctx_partial.intrusive_min_logprobs[0], np.log(0.50), atol=1e-5)
+    assert np.isneginf(ctx_partial.intrusive_min_logprobs[1])
+
+
+def test_trellis_runtime_context_compile_size_validation():
+    """Test TrellisRuntimeContext.compile validates dimension matches against ground_truth."""
+    char_list = ["•", "a", "k", "e", "y"]
+    ground_truth = np.zeros((6, 2), dtype=np.int64)
+
+    # 1. is_syncope_token length mismatch raises ValueError
+    config_bad_syncope = CtcSegmentationParameters(
+        char_list=char_list,
+        is_syncope_token=[0, 1, 0, 0],  # len 4 != 6
+    )
+    with pytest.raises(ValueError, match="is_syncope_token length .* does not match ground_truth length"):
+        TrellisRuntimeContext.compile(config_bad_syncope, ground_truth)
+
+    # 2. is_intrusive_site length mismatch raises ValueError
+    config_bad_site = CtcSegmentationParameters(
+        char_list=char_list,
+        is_intrusive_site=[True, False, False, False, False, False, True],  # len 7 != 6
+    )
+    with pytest.raises(ValueError, match="is_intrusive_site length .* does not match ground_truth length"):
+        TrellisRuntimeContext.compile(config_bad_site, ground_truth)
+
+    # 3. Multidimensional mask raises ValueError
+    config_2d = CtcSegmentationParameters(
+        char_list=char_list,
+        is_syncope_token=np.zeros((6, 2), dtype=np.int8),
+    )
+    with pytest.raises(ValueError, match="is_syncope_token length"):
+        TrellisRuntimeContext.compile(config_2d, ground_truth)
+
+    # 4. Correct matching lengths compile cleanly to C-contiguous int8
+    config_valid = CtcSegmentationParameters(
+        char_list=char_list,
+        is_syncope_token=[0, 1, 0, 1, 0, 0],
+        is_intrusive_site=[True, True, False, False, True, False],
+    )
+    ctx_valid = TrellisRuntimeContext.compile(config_valid, ground_truth)
+    assert ctx_valid.is_syncope_token.shape == (6,)
+    assert ctx_valid.is_syncope_token.dtype == np.int8
+    assert ctx_valid.is_syncope_token.flags.c_contiguous
+    assert ctx_valid.is_intrusive_site.shape == (6,)
+    assert ctx_valid.is_intrusive_site.dtype == np.int8
+    assert ctx_valid.is_intrusive_site.flags.c_contiguous
+
+
+def test_trellis_runtime_context_compile_defaults():
+    """Test TrellisRuntimeContext.compile default attributes when optional fields are None."""
+    char_list = ["•", "a", "b"]
+    ground_truth = np.zeros((4, 2), dtype=np.int64)
+
+    # No intrusive or syncope tokens
+    config = CtcSegmentationParameters(char_list=char_list)
+    ctx = TrellisRuntimeContext.compile(config, ground_truth)
+
+    assert ctx.intrusive_token_ids.shape == (0,)
+    assert ctx.intrusive_token_ids.dtype == np.int64
+    assert ctx.intrusive_penalties.shape == (0,)
+    assert ctx.intrusive_penalties.dtype == np.float32
+    assert ctx.intrusive_min_logprobs.shape == (0,)
+    assert ctx.intrusive_min_logprobs.dtype == np.float32
+    assert ctx.is_syncope_token.shape == (0,)
+    assert ctx.is_syncope_token.dtype == np.int8
+    assert ctx.is_intrusive_site.shape == (0,)
+    assert ctx.is_intrusive_site.dtype == np.int8
+    assert ctx.intrusive_max_stride == 4
+    assert ctx.blank == 0
+
+    # With intrusive tokens, intrusive_min_logprobs=None -> -np.inf
+    config_intrusive = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["a", "b"],
+    )
+    ctx_intrusive = TrellisRuntimeContext.compile(config_intrusive, ground_truth)
+    assert ctx_intrusive.intrusive_token_ids.shape == (2,)
+    assert np.all(np.isneginf(ctx_intrusive.intrusive_min_logprobs))
+    assert np.allclose(ctx_intrusive.intrusive_penalties, 0.1)
+
+
+def test_trellis_runtime_context_compile_type_errors():
+    """Test TrellisRuntimeContext.compile error handling for invalid token types or parameters."""
+    ground_truth = np.zeros((4, 2), dtype=np.int64)
+
+    # 1. Intrusive token not found in char_list
+    config_missing = CtcSegmentationParameters(
+        char_list=["•", "a"],
+        intrusive_tokens=["z"],
+    )
+    with pytest.raises(ValueError, match="Intrusive token 'z' not found in char_list"):
+        TrellisRuntimeContext.compile(config_missing, ground_truth)
+
+    # 2. Invalid intrusive token element type (e.g. float or object)
+    config_invalid_token = CtcSegmentationParameters(
+        char_list=["•", "a"],
+        intrusive_tokens=[3.14],  # type: ignore
+    )
+    with pytest.raises(TypeError, match="Invalid intrusive token type"):
+        TrellisRuntimeContext.compile(config_invalid_token, ground_truth)
+
+    # 3. Invalid intrusive_penalties type
+    config_bad_penalties = CtcSegmentationParameters(
+        char_list=["•", "a"],
+        intrusive_tokens=["a"],
+        intrusive_penalties="invalid_type",  # type: ignore
+    )
+    with pytest.raises(TypeError, match="Invalid intrusive_penalties type"):
+        TrellisRuntimeContext.compile(config_bad_penalties, ground_truth)
+
+    # 4. Invalid intrusive_min_logprobs type
+    config_bad_min_logprobs = CtcSegmentationParameters(
+        char_list=["•", "a"],
+        intrusive_tokens=["a"],
+        intrusive_min_logprobs="invalid_type",  # type: ignore
+    )
+    with pytest.raises(TypeError, match="Invalid intrusive_min_logprobs type"):
+        TrellisRuntimeContext.compile(config_bad_min_logprobs, ground_truth)

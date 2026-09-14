@@ -1,4 +1,5 @@
 """Import all functions of the CTC segmentation package."""
+from .ctc_segmentation import TrellisRuntimeContext
 from .ctc_segmentation import ctc_segmentation
 from .ctc_segmentation import CtcSegmentationParameters
 from .ctc_segmentation import determine_utterance_segments
