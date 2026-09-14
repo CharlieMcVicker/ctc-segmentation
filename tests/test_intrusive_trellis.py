@@ -985,3 +985,348 @@ def test_trellis_runtime_context_backtracking_compatibility():
     assert len(timings_v) == len(gt_mat)
 
 
+# ==============================================================================
+# Verification Matrix for Min-Logprob Intrusive Gating (TASK-35)
+# ==============================================================================
+
+
+@pytest.mark.parametrize("prob_h", [0.05, 0.15, 0.30])
+def test_diffuse_noise_rejection_gating(prob_h):
+    """AC #1: Diffuse noise (e.g. P=0.15 for /h/) is suppressed when intrusive_min_logprobs is set."""
+    word = "akeya"
+    spoken_chars = ["a", "k", "e", "y", "a"]
+    char_list = ["•"] + sorted(list(set(word + "h")))
+    h_idx = char_list.index("h")
+
+    # Frames: [blank*2, a*2, k*2, e*2, y*2, diffuse_h*1, a*2, blank*2]
+    total_frames = 2 + 8 + 1 + 2 + 2  # 15 frames
+    lpz_diffuse = np.full((total_frames, len(char_list)), -10.0, dtype=np.float32)
+    lpz_diffuse[0:2, 0] = 0.0  # initial blank
+    lpz_diffuse[2:4, char_list.index("a")] = 0.0
+    lpz_diffuse[4:6, char_list.index("k")] = 0.0
+    lpz_diffuse[6:8, char_list.index("e")] = 0.0
+    lpz_diffuse[8:10, char_list.index("y")] = 0.0
+    # Diffuse noise frame at t=10:
+    lpz_diffuse[10, h_idx] = float(np.log(prob_h))
+    lpz_diffuse[10, 0] = -5.0
+    # Final 'a' at t=11..13:
+    lpz_diffuse[11:13, char_list.index("a")] = 0.0
+    lpz_diffuse[13:15, 0] = 0.0  # final blank
+
+    gt_mat, utt_indices = prepare_text(CtcSegmentationParameters(char_list=char_list), [word], char_list)
+
+    # 1. Without threshold gating (intrusive_min_logprobs=None, low penalty):
+    # Diffuse noise is mistakenly captured as an intrusive detour
+    config_ungated = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h"],
+        intrusive_penalty=0.01,
+        intrusive_min_logprobs=None,
+        min_window_size=50,
+        score_min_mean_over_L=2,
+    )
+    _, _, states_ungated = ctc_segmentation(config_ungated, lpz_diffuse, gt_mat)
+    assert "h" in states_ungated, "Expected ungated trellis to capture diffuse noise"
+
+    # 2. With scalar threshold intrusive_min_logprobs=0.40:
+    # Since prob_h < 0.40 (ln(prob_h) < ln(0.40)), diffuse noise is rejected
+    config_gated_scalar = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h"],
+        intrusive_penalty=0.01,
+        intrusive_min_logprobs=0.40,
+        min_window_size=50,
+        score_min_mean_over_L=2,
+    )
+    timings_scalar, probs_scalar, states_scalar = ctc_segmentation(config_gated_scalar, lpz_diffuse, gt_mat)
+    assert "h" not in states_scalar, f"Expected diffuse noise P={prob_h} to be suppressed by scalar threshold"
+
+    # 3. With dictionary threshold intrusive_min_logprobs={"h": 0.40}:
+    config_gated_dict = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h"],
+        intrusive_penalty=0.01,
+        intrusive_min_logprobs={"h": 0.40},
+        min_window_size=50,
+        score_min_mean_over_L=2,
+    )
+    timings_dict, probs_dict, states_dict = ctc_segmentation(config_gated_dict, lpz_diffuse, gt_mat)
+    assert "h" not in states_dict, f"Expected diffuse noise P={prob_h} to be suppressed by dict threshold"
+
+    # Verify segmentation confidence remains valid
+    segments = determine_utterance_segments(config_gated_scalar, utt_indices, probs_scalar, timings_scalar, [word])
+    assert segments[0][2] > -3.0
+
+
+@pytest.mark.parametrize("token,word,peak_prob", [
+    ("h", "akeya", 0.70),
+    ("'", "tsanvsv", 0.70),
+    ("h", "akeya", 0.95),
+    ("'", "tsanvsv", 0.55),
+])
+def test_genuine_acoustic_peaks_acceptance(token, word, peak_prob):
+    """AC #2: Genuine acoustic peaks (e.g. P>=0.40) trigger correct intrusive alignment and state reconstruction."""
+    char_list = ["•"] + sorted(list(set(word + "h'")))
+    tok_idx = char_list.index(token)
+
+    # Construct spoken tokens containing intrusive token
+    if token == "h":
+        spoken_chars = ["a", "k", "e", "y", "h", "a"]
+    else:
+        spoken_chars = ["t", "s", "a", "'", "n", "v", "s", "v"]
+
+    gt_mat, utt_indices = prepare_text(CtcSegmentationParameters(char_list=char_list), [word], char_list)
+    lpz = make_emissions(spoken_chars, char_list, frames_per_char=1, blank_frames=2)
+
+    # Set the intrusive peak frame probability to peak_prob
+    intrusive_t = 2 + spoken_chars.index(token)
+    lpz[intrusive_t, tok_idx] = float(np.log(peak_prob))
+    lpz[intrusive_t, 0] = -5.0
+
+    # Config with threshold 0.40 (peak_prob >= 0.40 -> passes gating)
+    config = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=[token],
+        intrusive_penalty=0.2,
+        intrusive_min_logprobs=0.40,
+        min_window_size=50,
+        score_min_mean_over_L=2,
+    )
+
+    timings, probs, states = ctc_segmentation(config, lpz, gt_mat)
+
+    # Verify token is accepted in states
+    assert token in states, f"Expected genuine acoustic peak P={peak_prob} for {token} to be accepted"
+
+    # Verify state reconstruction order
+    non_empty = [s for s in states if s and s != config.self_transition]
+    assert token in non_empty
+    tok_pos = non_empty.index(token)
+    if token == "h":
+        assert non_empty.index("y") < tok_pos < non_empty.index("a", tok_pos)
+    else:
+        assert non_empty.index("a") < tok_pos < non_empty.index("n", tok_pos)
+
+    # Verify segments confidence
+    segments = determine_utterance_segments(config, utt_indices, probs, timings, [word])
+    assert segments[0][2] > -1.0
+
+
+def test_heterogeneous_per_token_thresholds_and_penalties():
+    """AC #3: Heterogeneous per-token thresholds and penalties for differential gating between glottal stop and aspiration."""
+    word = "akeya"
+    char_list = ["•"] + sorted(list(set(word + "h'")))
+    h_idx = char_list.index("h")
+    g_idx = char_list.index("'")
+
+    gt_mat, _ = prepare_text(CtcSegmentationParameters(char_list=char_list), [word], char_list)
+
+    # Base spoken frames: [blank, blank, a, k, e, y, candidate_frame, a, blank, blank]
+    def build_candidate_lpz(prob_h, prob_g):
+        total_frames = 10
+        lpz = np.full((total_frames, len(char_list)), -10.0, dtype=np.float32)
+        lpz[0:2, 0] = 0.0
+        lpz[2, char_list.index("a")] = 0.0
+        lpz[3, char_list.index("k")] = 0.0
+        lpz[4, char_list.index("e")] = 0.0
+        lpz[5, char_list.index("y")] = 0.0
+        lpz[6, h_idx] = float(np.log(prob_h)) if prob_h > 0 else -20.0
+        lpz[6, g_idx] = float(np.log(prob_g)) if prob_g > 0 else -20.0
+        lpz[6, 0] = -5.0
+        lpz[7, char_list.index("a")] = 0.0
+        lpz[8:10, 0] = 0.0
+        return lpz
+
+    config = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h", "'"],
+        intrusive_min_logprobs={"h": 0.40, "'": 0.20},
+        intrusive_penalties={"h": 1.0, "'": 0.1},
+        min_window_size=50,
+        score_min_mean_over_L=2,
+    )
+
+    # Scenario A: Diffuse aspiration P=0.30, glottal stop P=0.30
+    # h threshold is 0.40 (0.30 < 0.40 -> h gated out)
+    # ' threshold is 0.20 (0.30 >= 0.20 -> ' passes gating and penalty is 0.1)
+    lpz_a = build_candidate_lpz(prob_h=0.30, prob_g=0.30)
+    _, _, states_a = ctc_segmentation(config, lpz_a, gt_mat)
+    assert "'" in states_a, "Expected glottal stop to pass 0.20 threshold"
+    assert "h" not in states_a, "Expected aspiration P=0.30 to be gated out by 0.40 threshold"
+
+    # Scenario B: Strong aspiration P=0.85, weak glottal energy P=0.25
+    # Both pass thresholds (0.85 >= 0.40, 0.25 >= 0.20)
+    # Score h: ln(0.85) - 1.0 = -0.1625 - 1.0 = -1.1625
+    # Score ': ln(0.25) - 0.1 = -1.3863 - 0.1 = -1.4863
+    # h has higher score (-1.1625 > -1.4863) -> h is chosen
+    lpz_b = build_candidate_lpz(prob_h=0.85, prob_g=0.25)
+    _, _, states_b = ctc_segmentation(config, lpz_b, gt_mat)
+    assert "h" in states_b, "Expected high-probability aspiration to win over weak glottal stop"
+    assert "'" not in states_b, "Expected glottal stop to lose score competition against strong aspiration"
+
+    # Scenario C: Sub-threshold energy for both (P=0.30 for h, P=0.15 for ')
+    # 0.30 < 0.40 and 0.15 < 0.20 -> both suppressed
+    lpz_c = build_candidate_lpz(prob_h=0.30, prob_g=0.15)
+    _, _, states_c = ctc_segmentation(config, lpz_c, gt_mat)
+    assert "h" not in states_c, "Expected sub-threshold h to be suppressed"
+    assert "'" not in states_c, "Expected sub-threshold ' to be suppressed"
+
+
+def test_site_restricted_transitions_masking():
+    """AC #4: Site-restricted transitions using is_intrusive_site mask blocks detours at non-designated sites."""
+    word = "akeya"
+    char_list = ["•"] + sorted(list(set(word + "h")))
+    h_idx = char_list.index("h")
+    # Ground truth: '#'(0), '·'(1), 'a'(2), 'k'(3), 'e'(4), 'y'(5), 'a'(6), '·'(7)
+    gt_mat, _ = prepare_text(CtcSegmentationParameters(char_list=char_list), [word], char_list)
+    L = len(gt_mat)
+    assert L == 8
+
+    # Audio with high energy for 'h' at TWO sites:
+    # Site 1: between 'k' (t=3) and 'e' (t=5), candidate at t=4
+    # Site 2: between 'y' (t=6) and 'a' (t=8), candidate at t=7
+    # Frames: [blank, blank, a, k, h_site1, e, y, h_site2, a, blank, blank]
+    total_frames = 11
+    lpz = np.full((total_frames, len(char_list)), -10.0, dtype=np.float32)
+    lpz[0:2, 0] = 0.0
+    lpz[2, char_list.index("a")] = 0.0
+    lpz[3, char_list.index("k")] = 0.0
+    lpz[4, h_idx] = 0.0  # Strong 'h' energy at site 1 (before 'e', column 4)
+    lpz[5, char_list.index("e")] = 0.0
+    lpz[6, char_list.index("y")] = 0.0
+    lpz[7, h_idx] = 0.0  # Strong 'h' energy at site 2 (before 'a', column 6)
+    lpz[8, char_list.index("a")] = 0.0
+    lpz[9:11, 0] = 0.0
+
+    # 1. Mask allows ONLY site 2 (column 6 before final 'a')
+    mask_only_site2 = np.zeros(L, dtype=np.int8)
+    mask_only_site2[6] = 1
+    config_site2 = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h"],
+        intrusive_penalty=0.1,
+        is_intrusive_site=mask_only_site2,
+        min_window_size=50,
+        score_min_mean_over_L=2,
+    )
+    _, _, states_site2 = ctc_segmentation(config_site2, lpz, gt_mat)
+    non_empty_site2 = [s for s in states_site2 if s and s != config_site2.self_transition]
+    # 'h' count must be exactly 1
+    assert non_empty_site2.count("h") == 1
+    # 'h' must be after 'y' and before 'a', NOT between 'k' and 'e'
+    k_pos = non_empty_site2.index("k")
+    e_pos = non_empty_site2.index("e")
+    y_pos = non_empty_site2.index("y")
+    h_pos = non_empty_site2.index("h")
+    a_pos = non_empty_site2.index("a", h_pos)
+    assert k_pos + 1 == e_pos, "Expected no 'h' between 'k' and 'e'"
+    assert y_pos < h_pos < a_pos, "Expected 'h' between 'y' and 'a'"
+
+    # 2. Mask allows ONLY site 1 (column 4 before 'e')
+    mask_only_site1 = np.zeros(L, dtype=np.int8)
+    mask_only_site1[4] = 1
+    config_site1 = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h"],
+        intrusive_penalty=0.1,
+        is_intrusive_site=mask_only_site1,
+        min_window_size=50,
+        score_min_mean_over_L=2,
+    )
+    _, _, states_site1 = ctc_segmentation(config_site1, lpz, gt_mat)
+    non_empty_site1 = [s for s in states_site1 if s and s != config_site1.self_transition]
+    assert non_empty_site1.count("h") == 1
+    k_pos1 = non_empty_site1.index("k")
+    h_pos1 = non_empty_site1.index("h")
+    e_pos1 = non_empty_site1.index("e")
+    y_pos1 = non_empty_site1.index("y")
+    a_pos1 = non_empty_site1.index("a", y_pos1)
+    assert k_pos1 < h_pos1 < e_pos1, "Expected 'h' between 'k' and 'e'"
+    assert y_pos1 + 1 == a_pos1, "Expected no 'h' between 'y' and 'a'"
+
+    # 3. Mask is all zeros (blocks ALL sites)
+    mask_all_blocked = np.zeros(L, dtype=np.int8)
+    config_blocked = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h"],
+        intrusive_penalty=0.1,
+        is_intrusive_site=mask_all_blocked,
+        min_window_size=50,
+        score_min_mean_over_L=2,
+    )
+    _, _, states_blocked = ctc_segmentation(config_blocked, lpz, gt_mat)
+    assert "h" not in states_blocked, "Expected all detours to be blocked when is_intrusive_site is all zeros"
+
+
+def test_baseline_alignment_bitwise_identical_regression():
+    """AC #5: Regression tests confirming baseline alignment without gating remains bitwise identical."""
+    words = ["akeya", "tsanvsv", "adalenisgv"]
+    char_list = ["•"] + sorted(list(set("".join(words) + "h'")))
+
+    # Generate synthetic audio emissions for all words
+    spoken_chars = ["a", "k", "e", "y", "a", "•", "t", "s", "a", "n", "v", "s", "v", "•", "a", "d", "a", "l", "e", "n", "i", "s", "g", "v"]
+    lpz = make_emissions(spoken_chars, char_list, frames_per_char=2, blank_frames=3)
+
+    # 1. Baseline parameters (default)
+    config_base = CtcSegmentationParameters(
+        char_list=char_list,
+        min_window_size=50,
+        score_min_mean_over_L=2,
+    )
+    gt_base, utt_base = prepare_text(config_base, words, char_list)
+    timings_base, probs_base, states_base = ctc_segmentation(config_base, lpz, gt_base)
+    segs_base = determine_utterance_segments(config_base, utt_base, probs_base, timings_base, words)
+
+    # 2. intrusive_tokens=None
+    config_none = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=None,
+        min_window_size=50,
+        score_min_mean_over_L=2,
+    )
+    gt_none, utt_none = prepare_text(config_none, words, char_list)
+    timings_none, probs_none, states_none = ctc_segmentation(config_none, lpz, gt_none)
+    segs_none = determine_utterance_segments(config_none, utt_none, probs_none, timings_none, words)
+
+    # 3. intrusive_tokens=[]
+    config_empty = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=[],
+        min_window_size=50,
+        score_min_mean_over_L=2,
+    )
+    gt_empty, utt_empty = prepare_text(config_empty, words, char_list)
+    timings_empty, probs_empty, states_empty = ctc_segmentation(config_empty, lpz, gt_empty)
+    segs_empty = determine_utterance_segments(config_empty, utt_empty, probs_empty, timings_empty, words)
+
+    # 4. intrusive_min_logprobs set but intrusive_tokens=None
+    config_unused_gating = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=None,
+        intrusive_min_logprobs=0.40,
+        min_window_size=50,
+        score_min_mean_over_L=2,
+    )
+    gt_gated, utt_gated = prepare_text(config_unused_gating, words, char_list)
+    timings_gated, probs_gated, states_gated = ctc_segmentation(config_unused_gating, lpz, gt_gated)
+    segs_gated = determine_utterance_segments(config_unused_gating, utt_gated, probs_gated, timings_gated, words)
+
+    # 5. Bitwise identical assertions across all non-gated / baseline runs
+    np.testing.assert_array_equal(timings_base, timings_none)
+    np.testing.assert_array_equal(timings_base, timings_empty)
+    np.testing.assert_array_equal(timings_base, timings_gated)
+
+    np.testing.assert_array_equal(probs_base, probs_none)
+    np.testing.assert_array_equal(probs_base, probs_empty)
+    np.testing.assert_array_equal(probs_base, probs_gated)
+
+    assert states_base == states_none
+    assert states_base == states_empty
+    assert states_base == states_gated
+
+    assert segs_base == segs_none
+    assert segs_base == segs_empty
+    assert segs_base == segs_gated
+
+
+
