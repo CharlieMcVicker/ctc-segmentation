@@ -24,7 +24,9 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                       np.ndarray[np.int8_t, ndim=1] is_syncope_token,
                       float syncope_penalty,
                       np.ndarray[np.int64_t, ndim=1] intrusive_token_ids,
-                      float intrusive_penalty,
+                      np.ndarray[np.float32_t, ndim=1] intrusive_penalties,
+                      np.ndarray[np.float32_t, ndim=1] intrusive_min_logprobs,
+                      np.ndarray[np.int8_t, ndim=1] is_intrusive_site,
                       int intrusive_max_stride,
                       int blank,
                       int flags):
@@ -32,7 +34,8 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
 
     Supports blank-constrained syncope skip transitions (enforcing the Consonant
     Preservation Invariant and Blank-Only Stride Invariants for Case A and Case B)
-    and blank-tolerant intrusive token detours.
+    and blank-tolerant intrusive token detours with acoustic log-probability gating
+    and per-token penalties.
 
     :param table: table filled with maximum joint probabilities k_{t,j}
     :param lpz: character probabilities of each time frame
@@ -43,7 +46,9 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
         invariant so non-syncope characters/consonants are preserved).
     :param syncope_penalty: penalty subtracted for syncope skip transition
     :param intrusive_token_ids: 1D array of token IDs eligible for intrusive insertion
-    :param intrusive_penalty: penalty subtracted for intrusive detour transition
+    :param intrusive_penalties: 1D array of penalties subtracted per intrusive token
+    :param intrusive_min_logprobs: 1D array of posterior log-probability thresholds per intrusive token
+    :param is_intrusive_site: 1D mask array gating allowed intrusive detour transition sites
     :param intrusive_max_stride: maximum blank frame stride for intrusive transitions
     :param blank: label ID of the blank symbol, usually 0
     :param flags: configuration options, default 0
@@ -63,7 +68,7 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
     cdef np.ndarray[np.int64_t, ndim=1] cur_offset = np.zeros([ground_truth.shape[1]], np.int64) - 1
     cdef float max_lpz_prob
     cdef float p, v_prob, p_cand, blank_sum, base_prob
-    cdef int s, c_prev, delta_offset, t_prev, j_idx, j, delta, b_t
+    cdef int s, c_prev, delta_offset, t_prev, j_idx, j, delta, b_t, t_detour, has_candidate
     cdef int num_intrusive_tokens = intrusive_token_ids.shape[0]
     cdef int stay_transition_cost_zero
     cdef int preamble_transition_cost_zero
@@ -151,9 +156,14 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                                     if v_prob > syncope_skip_prob:
                                         syncope_skip_prob = v_prob
 
-            # Compute intrusive detour probability with blank-stride tolerance
+            # Compute intrusive detour probability with blank-stride tolerance and acoustic gating
             intrusive_prob = prob_max
-            if num_intrusive_tokens > 0 and c >= 1 and t >= 2:
+            if (
+                num_intrusive_tokens > 0
+                and c >= 1
+                and t >= 2
+                and (is_intrusive_site.shape[0] == 0 or is_intrusive_site[c] == 1)
+            ):
                 for s in range(ground_truth.shape[1]):
                     if ground_truth[c, s] == -1 or c - 1 - s < 0:
                         continue
@@ -161,20 +171,31 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                     for delta in range(0, min(intrusive_max_stride + 1, t - 1)):
                         t_prev = t - 2 - delta + delta_offset
                         if 0 <= t_prev < table.shape[0]:
+                            t_detour = t - 1 - delta + offset_sum
+
+                            # Fast early-exit: check if any candidate satisfies threshold
+                            has_candidate = 0
+                            for j_idx in range(num_intrusive_tokens):
+                                if lpz[t_detour, intrusive_token_ids[j_idx]] >= intrusive_min_logprobs[j_idx]:
+                                    has_candidate = 1
+                                    break
+                            if not has_candidate:
+                                continue
+
                             blank_sum = 0.0
                             for b_t in range(t - delta, t):
                                 blank_sum += lpz[b_t + offset_sum, blank]
                             base_prob = (
                                 table[t_prev, c - 1 - s]
-                                - intrusive_penalty
                                 + blank_sum
                                 + lpz[t + offset_sum, ground_truth[c, s]]
                             )
                             for j_idx in range(num_intrusive_tokens):
                                 j = intrusive_token_ids[j_idx]
-                                p_cand = base_prob + lpz[t - 1 - delta + offset_sum, j]
-                                if p_cand > intrusive_prob:
-                                    intrusive_prob = p_cand
+                                if lpz[t_detour, j] >= intrusive_min_logprobs[j_idx]:
+                                    p_cand = base_prob + lpz[t_detour, j] - intrusive_penalties[j_idx]
+                                    if p_cand > intrusive_prob:
+                                        intrusive_prob = p_cand
 
             # Compute stay probability
             if t - 1 < 0:

@@ -15,6 +15,7 @@ from ctc_segmentation import (
     prepare_token_list,
     prepare_tokenized_text,
 )
+from ctc_segmentation.ctc_segmentation_dyn import cython_fill_table
 
 
 def make_emissions(spoken_chars, char_list, frames_per_char=2, blank_frames=2):
@@ -664,3 +665,285 @@ def test_trellis_runtime_context_compile_type_errors():
     )
     with pytest.raises(TypeError, match="Invalid intrusive_min_logprobs type"):
         TrellisRuntimeContext.compile(config_bad_min_logprobs, ground_truth)
+
+
+def test_cython_fill_table_min_logprob_gating():
+    """Test cython_fill_table skips intrusive detour when posterior logprob is below threshold."""
+    # ground_truth: '#' (0), 'a' (1)
+    # columns: c=0 ('#'), c=1 ('a')
+    ground_truth = np.array([[0], [1]], dtype=np.int64)
+    # lpz: shape (5 frames, 3 vocab tokens: 0=blank, 1='a', 2='h')
+    lpz = np.full((5, 3), -10.0, dtype=np.float32)
+    lpz[0, 0] = 0.0  # t=0 blank
+    lpz[1, 2] = -2.0  # t=1 'h' with posterior logprob -2.0 (linear prob ~0.135)
+    lpz[2, 1] = 0.0  # t=2 'a'
+
+    offsets = np.zeros(2, dtype=np.int64)
+    is_syncope_token = np.zeros(2, dtype=np.int8)
+    intrusive_token_ids = np.array([2], dtype=np.int64)
+    intrusive_penalties = np.array([0.1], dtype=np.float32)
+    is_intrusive_site = np.zeros(0, dtype=np.int8)
+
+    # Case 1: Threshold is strict (e.g. -1.0), so -2.0 is below threshold -> detour blocked
+    intrusive_min_logprobs_strict = np.array([-1.0], dtype=np.float32)
+    table1 = np.full((5, 2), -1e10, dtype=np.float32)
+    cython_fill_table(
+        table1,
+        lpz,
+        ground_truth,
+        offsets,
+        is_syncope_token,
+        0.25,
+        intrusive_token_ids,
+        intrusive_penalties,
+        intrusive_min_logprobs_strict,
+        is_intrusive_site,
+        4,
+        0,
+        0,
+    )
+
+    # Case 2: Threshold is loose (e.g. -3.0), so -2.0 satisfies threshold -> detour allowed
+    intrusive_min_logprobs_loose = np.array([-3.0], dtype=np.float32)
+    table2 = np.full((5, 2), -1e10, dtype=np.float32)
+    cython_fill_table(
+        table2,
+        lpz,
+        ground_truth,
+        offsets,
+        is_syncope_token,
+        0.25,
+        intrusive_token_ids,
+        intrusive_penalties,
+        intrusive_min_logprobs_loose,
+        is_intrusive_site,
+        4,
+        0,
+        0,
+    )
+
+    # At t=2, c=1: table2 should have higher score from the detour transition than table1
+    # detour score: table[0, 0] (0.0) + lpz[1, 2] (-2.0) - penalty (0.1) + lpz[2, 1] (0.0) = -2.1
+    # switch score without detour at t=2: table[1, 0] (blank stay: 0.0 + lpz[1,0](-10) = -10) + lpz[2, 1](0.0) = -10
+    assert table2[2, 1] > table1[2, 1]
+    assert np.isclose(table2[2, 1], -2.1, atol=1e-5)
+
+
+def test_cython_fill_table_site_masking():
+    """Test cython_fill_table respects is_intrusive_site masking array."""
+    # ground_truth: '#' (0), 'a' (1), 'b' (2)
+    # columns: c=0, c=1, c=2
+    ground_truth = np.array([[0], [1], [2]], dtype=np.int64)
+    lpz = np.full((6, 4), -10.0, dtype=np.float32)
+    lpz[0, 0] = 0.0  # t=0 blank
+    lpz[1, 3] = 0.0  # t=1 intrusive 'h' (id 3)
+    lpz[2, 1] = 0.0  # t=2 'a' (id 1)
+
+    offsets = np.zeros(3, dtype=np.int64)
+    is_syncope_token = np.zeros(3, dtype=np.int8)
+    intrusive_token_ids = np.array([3], dtype=np.int64)
+    intrusive_penalties = np.array([0.1], dtype=np.float32)
+    intrusive_min_logprobs = np.array([-np.inf], dtype=np.float32)
+
+    # Case 1: Site mask blocks column 1 (is_intrusive_site[1] == 0)
+    site_mask_blocked = np.array([0, 0, 1], dtype=np.int8)
+    table_blocked = np.full((6, 3), -1e10, dtype=np.float32)
+    cython_fill_table(
+        table_blocked,
+        lpz,
+        ground_truth,
+        offsets,
+        is_syncope_token,
+        0.25,
+        intrusive_token_ids,
+        intrusive_penalties,
+        intrusive_min_logprobs,
+        site_mask_blocked,
+        4,
+        0,
+        0,
+    )
+
+    # Case 2: Site mask allows column 1 (is_intrusive_site[1] == 1)
+    site_mask_allowed = np.array([0, 1, 1], dtype=np.int8)
+    table_allowed = np.full((6, 3), -1e10, dtype=np.float32)
+    cython_fill_table(
+        table_allowed,
+        lpz,
+        ground_truth,
+        offsets,
+        is_syncope_token,
+        0.25,
+        intrusive_token_ids,
+        intrusive_penalties,
+        intrusive_min_logprobs,
+        site_mask_allowed,
+        4,
+        0,
+        0,
+    )
+
+    # At t=2, c=1: table_allowed should have detour score ~ -0.1, whereas table_blocked should be much lower
+    assert table_allowed[2, 1] > table_blocked[2, 1]
+    assert np.isclose(table_allowed[2, 1], -0.1, atol=1e-5)
+
+
+def test_cython_fill_table_per_token_penalties():
+    """Test cython_fill_table applies distinct per-token penalties."""
+    ground_truth = np.array([[0], [1]], dtype=np.int64)
+    lpz = np.full((5, 4), -10.0, dtype=np.float32)
+    lpz[0, 0] = 0.0  # t=0 blank
+    lpz[1, 2] = 0.0  # t=1 token 2 (e.g. 'h')
+    lpz[1, 3] = 0.0  # t=1 token 3 (e.g. "'")
+    lpz[2, 1] = 0.0  # t=2 'a'
+
+    offsets = np.zeros(2, dtype=np.int64)
+    is_syncope_token = np.zeros(2, dtype=np.int8)
+    intrusive_token_ids = np.array([2, 3], dtype=np.int64)
+    is_intrusive_site = np.zeros(0, dtype=np.int8)
+    intrusive_min_logprobs = np.array([-np.inf, -np.inf], dtype=np.float32)
+
+    # Set token 2 penalty = 0.8, token 3 penalty = 0.2
+    intrusive_penalties = np.array([0.8, 0.2], dtype=np.float32)
+    table = np.full((5, 2), -1e10, dtype=np.float32)
+    cython_fill_table(
+        table,
+        lpz,
+        ground_truth,
+        offsets,
+        is_syncope_token,
+        0.25,
+        intrusive_token_ids,
+        intrusive_penalties,
+        intrusive_min_logprobs,
+        is_intrusive_site,
+        4,
+        0,
+        0,
+    )
+
+    # The max detour should take token 3 with penalty 0.2 (table[2, 1] = 0.0 - 0.2 + 0.0 = -0.2)
+    assert np.isclose(table[2, 1], -0.2, atol=1e-5)
+
+
+def test_intrusive_gating_and_penalties_end_to_end():
+    """End-to-end test verifying gating and per-token penalty preferences via ctc_segmentation."""
+    word = "akeya"
+    char_list = ["•"] + sorted(list(set(word + "h'")))
+
+    # Spoken audio has 'h' at moderate probability (lpz = -0.5, ~60% prob)
+    spoken_chars = ["a", "k", "e", "y", "h", "a"]
+    gt_mat, utt_indices = prepare_text(CtcSegmentationParameters(char_list=char_list), [word], char_list)
+
+    lpz = make_emissions(spoken_chars, char_list, frames_per_char=1, blank_frames=2)
+    h_idx = char_list.index("h")
+    # 'a'(2), 'k'(3), 'e'(4), 'y'(5), 'h'(6), 'a'(7)
+    lpz[6, h_idx] = -0.5
+    lpz[6, 0] = -5.0
+
+    # 1. With intrusive_min_logprobs = 0.80 (~ -0.22 logprob), 'h' (-0.5) is rejected
+    config_strict = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h"],
+        intrusive_min_logprobs=0.80,
+        intrusive_penalty=0.1,
+        min_window_size=50,
+        score_min_mean_over_L=2,
+    )
+    _, _, states_strict = ctc_segmentation(config_strict, lpz, gt_mat)
+    assert "h" not in states_strict
+
+    # 2. With intrusive_min_logprobs = 0.50 (~ -0.69 logprob), 'h' (-0.5) is accepted
+    config_loose = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h"],
+        intrusive_min_logprobs=0.50,
+        intrusive_penalty=0.1,
+        min_window_size=50,
+        score_min_mean_over_L=2,
+    )
+    _, _, states_loose = ctc_segmentation(config_loose, lpz, gt_mat)
+    assert "h" in states_loose
+
+
+def test_intrusive_site_masking_end_to_end():
+    """End-to-end test verifying is_intrusive_site restricts detours to specified positions."""
+    word = "akeya"
+    char_list = ["•"] + sorted(list(set(word + "h")))
+    # Ground truth: '#', '·', 'a', 'k', 'e', 'y', 'a', '·'
+    # indices:       0    1    2    3    4    5    6    7
+    gt_mat, utt_indices = prepare_text(CtcSegmentationParameters(char_list=char_list), [word], char_list)
+    L = len(gt_mat)
+
+    # Audio has spoken intrusive 'h' between 'y' and 'a' (target column is 6 'a')
+    spoken_chars = ["a", "k", "e", "y", "h", "a"]
+    lpz = make_emissions(spoken_chars, char_list, frames_per_char=1, blank_frames=2)
+
+    # 1. Site mask that disables position 6 (where 'a' is)
+    site_mask_blocked = np.ones(L, dtype=np.int8)
+    site_mask_blocked[6] = 0
+    config_blocked = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h"],
+        intrusive_penalty=0.1,
+        is_intrusive_site=site_mask_blocked,
+        min_window_size=50,
+        score_min_mean_over_L=2,
+    )
+    _, _, states_blocked = ctc_segmentation(config_blocked, lpz, gt_mat)
+    assert "h" not in states_blocked
+
+    # 2. Site mask that enables position 6
+    site_mask_allowed = np.zeros(L, dtype=np.int8)
+    site_mask_allowed[6] = 1
+    config_allowed = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h"],
+        intrusive_penalty=0.1,
+        is_intrusive_site=site_mask_allowed,
+        min_window_size=50,
+        score_min_mean_over_L=2,
+    )
+    _, _, states_allowed = ctc_segmentation(config_allowed, lpz, gt_mat)
+    assert "h" in states_allowed
+
+
+def test_intrusive_per_token_penalties_end_to_end():
+    """End-to-end test verifying per-token penalty dict selects the lower penalty candidate."""
+    word = "akeya"
+    char_list = ["•"] + sorted(list(set(word + "h'")))
+    gt_mat, _ = prepare_text(CtcSegmentationParameters(char_list=char_list), [word], char_list)
+
+    # Audio has equal energy for both 'h' and "'" at frame 6
+    spoken_chars = ["a", "k", "e", "y", "h", "a"]
+    lpz = make_emissions(spoken_chars, char_list, frames_per_char=1, blank_frames=2)
+    h_idx = char_list.index("h")
+    g_idx = char_list.index("'")
+    lpz[6, h_idx] = 0.0
+    lpz[6, g_idx] = 0.0
+
+    # Case A: 'h' has penalty 0.1, "'" has penalty 0.8 -> 'h' is chosen
+    config_prefer_h = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h", "'"],
+        intrusive_penalties={"h": 0.1, "'": 0.8},
+        min_window_size=50,
+        score_min_mean_over_L=2,
+    )
+    _, _, states_h = ctc_segmentation(config_prefer_h, lpz, gt_mat)
+    assert "h" in states_h
+    assert "'" not in states_h
+
+    # Case B: "'" has penalty 0.1, 'h' has penalty 0.8 -> "'" is chosen
+    config_prefer_g = CtcSegmentationParameters(
+        char_list=char_list,
+        intrusive_tokens=["h", "'"],
+        intrusive_penalties={"h": 0.8, "'": 0.1},
+        min_window_size=50,
+        score_min_mean_over_L=2,
+    )
+    _, _, states_g = ctc_segmentation(config_prefer_g, lpz, gt_mat)
+    assert "'" in states_g
+    assert "h" not in states_g
+
+

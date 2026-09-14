@@ -539,12 +539,8 @@ def ctc_segmentation(
     else:
         is_syncope_token_arr = np.asarray(is_syncope_token, dtype=np.int8)
 
-    syncope_penalty = float(getattr(config, "syncope_penalty", 0.25))
-
-    intrusive_token_ids = _get_intrusive_token_ids(config)
-    num_intrusive_tokens = len(intrusive_token_ids)
-    intrusive_penalty = float(getattr(config, "intrusive_penalty", 0.1))
-    intrusive_max_stride = int(getattr(config, "intrusive_max_stride", 4))
+    config.is_syncope_token = is_syncope_token_arr
+    runtime_ctx = TrellisRuntimeContext.compile(config, ground_truth)
 
     window_size = config.min_window_size
     # Try multiple window lengths if it fails
@@ -562,13 +558,15 @@ def ctc_segmentation(
             lpz.astype(np.float32),
             np.array(ground_truth, dtype=np.int64),
             offsets,
-            is_syncope_token_arr,
-            syncope_penalty,
-            intrusive_token_ids,
-            intrusive_penalty,
-            intrusive_max_stride,
-            config.blank,
-            config.flags,
+            runtime_ctx.is_syncope_token,
+            runtime_ctx.syncope_penalty,
+            runtime_ctx.intrusive_token_ids,
+            runtime_ctx.intrusive_penalties,
+            runtime_ctx.intrusive_min_logprobs,
+            runtime_ctx.is_intrusive_site,
+            runtime_ctx.intrusive_max_stride,
+            runtime_ctx.blank,
+            runtime_ctx.flags,
         )
         if config.backtrack_from_max_t:
             t = table.shape[0] - 1
@@ -628,7 +626,7 @@ def ctc_segmentation(
                                         est_v_prob = table[t, c] - table[t_prev, c_prev]
                                         expected_v_prob = (
                                             lpz[t + offsets[c], ground_truth[c, s]]
-                                            - syncope_penalty
+                                            - runtime_ctx.syncope_penalty
                                         )
                                         v_delta = abs(est_v_prob - expected_v_prob)
                                         if v_delta < min_syncope_skip_delta:
@@ -654,7 +652,7 @@ def ctc_segmentation(
                                         est_v_prob = table[t, c] - table[t_prev, c_prev]
                                         expected_v_prob = (
                                             lpz[t + offsets[c], ground_truth[c, s]]
-                                            - syncope_penalty
+                                            - runtime_ctx.syncope_penalty
                                         )
                                         v_delta = abs(est_v_prob - expected_v_prob)
                                         if v_delta < min_syncope_skip_delta:
@@ -667,31 +665,38 @@ def ctc_segmentation(
                 best_intrusive_j = None
                 best_intrusive_s = None
                 best_intrusive_stride = 0
-                if c >= 1 and t >= 2 and num_intrusive_tokens > 0:
+                if (
+                    c >= 1
+                    and t >= 2
+                    and len(runtime_ctx.intrusive_token_ids) > 0
+                    and (runtime_ctx.is_intrusive_site.shape[0] == 0 or runtime_ctx.is_intrusive_site[c] == 1)
+                ):
                     for s in range(ground_truth.shape[1]):
                         if ground_truth[c, s] == -1 or c - 1 - s < 0:
                             continue
                         offset = offsets[c] - offsets[c - 1 - s]
-                        for delta in range(0, min(intrusive_max_stride + 1, t - 1)):
+                        for delta in range(0, min(runtime_ctx.intrusive_max_stride + 1, t - 1)):
                                 t_prev = t - 2 - delta + offset
                                 if 0 <= t_prev < table.shape[0]:
                                     blank_sum = 0.0
                                     for b_t in range(t - delta, t):
                                         blank_sum += lpz[b_t + offsets[c], blank]
-                                    for j in intrusive_token_ids:
-                                        expected_p = (
-                                            table[t_prev, c - 1 - s]
-                                            + lpz[t - 1 - delta + offsets[c], j]
-                                            - intrusive_penalty
-                                            + blank_sum
-                                            + lpz[t + offsets[c], ground_truth[c, s]]
-                                        )
-                                        diff = abs(table[t, c] - expected_p)
-                                        if diff < min_intrusive_delta:
-                                            min_intrusive_delta = diff
-                                            best_intrusive_j = j
-                                            best_intrusive_s = s
-                                            best_intrusive_stride = delta
+                                    for j_idx, j in enumerate(runtime_ctx.intrusive_token_ids):
+                                        t_detour_frame = t - 1 - delta + offsets[c]
+                                        if lpz[t_detour_frame, j] >= runtime_ctx.intrusive_min_logprobs[j_idx]:
+                                            expected_p = (
+                                                table[t_prev, c - 1 - s]
+                                                + lpz[t_detour_frame, j]
+                                                - runtime_ctx.intrusive_penalties[j_idx]
+                                                + blank_sum
+                                                + lpz[t + offsets[c], ground_truth[c, s]]
+                                            )
+                                            diff = abs(table[t, c] - expected_p)
+                                            if diff < min_intrusive_delta:
+                                                min_intrusive_delta = diff
+                                                best_intrusive_j = j
+                                                best_intrusive_s = s
+                                                best_intrusive_stride = delta
 
                 # Check which transition has been taken
                 if (
