@@ -334,6 +334,119 @@ class CtcSegmentationParameters:
         return output
 
 
+def _parse_intrusive_token_ids(
+    tokens: Optional[Sequence[Union[str, int]]],
+    char_list: Optional[Union[List[str], Tuple[str, ...], Set[str], Sequence[str]]] = None,
+) -> List[int]:
+    """Parse and validate intrusive token specifications (strings or integer IDs)."""
+    if tokens is None:
+        return []
+    c_list = list(char_list) if char_list is not None else None
+    token_ids = []
+    for t_item in tokens:
+        if isinstance(t_item, str):
+            if c_list is not None and t_item in c_list:
+                token_ids.append(c_list.index(t_item))
+            else:
+                raise ValueError(f"Intrusive token '{t_item}' not found in char_list")
+        elif isinstance(t_item, (int, np.integer)) and not isinstance(t_item, bool):
+            t_int = int(t_item)
+            if c_list is not None and not (0 <= t_int < len(c_list)):
+                raise ValueError(
+                    f"Intrusive token id {t_int} out of range for char_list of length {len(c_list)}"
+                )
+            if t_int < 0:
+                raise ValueError(
+                    f"Intrusive token id must be non-negative, got {t_int}"
+                )
+            token_ids.append(t_int)
+        else:
+            raise TypeError(
+                f"Invalid intrusive token type: Unsupported intrusive token type: {type(t_item)}"
+            )
+    return token_ids
+
+
+def _create_intrusive_mask(
+    config: CtcSegmentationParameters,
+    char_list: Optional[Sequence[str]] = None,
+) -> Optional[np.ndarray]:
+    """Create a 1D int8 mask indicating intrusive token indices in vocabulary (char_list)."""
+    c_list = char_list if char_list is not None else config.char_list
+    if config.intrusive_tokens is None or c_list is None:
+        return None
+    ids = _parse_intrusive_token_ids(config.intrusive_tokens, c_list)
+    mask = np.zeros(len(c_list), dtype=np.int8)
+    for idx in ids:
+        mask[idx] = 1
+    return mask
+
+
+def _get_intrusive_token_ids(
+    config: CtcSegmentationParameters,
+) -> np.ndarray:
+    """Extract and validate intrusive token IDs from configuration."""
+    if config.intrusive_tokens is not None:
+        token_ids = _parse_intrusive_token_ids(
+            config.intrusive_tokens, config.char_list
+        )
+        return np.array(token_ids, dtype=np.int64)
+    elif config.is_intrusive_token is not None:
+        return np.where(
+            np.asarray(config.is_intrusive_token, dtype=np.int8) == 1
+        )[0].astype(np.int64)
+    return np.zeros(0, dtype=np.int64)
+
+
+def _create_syncope_mask(
+    config: CtcSegmentationParameters,
+    ground_truth: Union[Sequence[Any], np.ndarray],
+    is_token_ids: bool = False,
+) -> np.ndarray:
+    """Create a 1D int8 mask indicating syncope token positions in ground_truth."""
+    mask = np.zeros(len(ground_truth), dtype=np.int8)
+    tokens = config.syncope_tokens
+    if tokens is None:
+        return mask
+    syncope_set = set(tokens)
+    for idx, item in enumerate(ground_truth):
+        if is_token_ids:
+            if item in syncope_set:
+                mask[idx] = 1
+            elif (
+                config.char_list is not None
+                and isinstance(item, (int, np.integer))
+                and 0 <= item < len(config.char_list)
+                and config.char_list[item] in syncope_set
+            ):
+                mask[idx] = 1
+        else:
+            if item in syncope_set:
+                mask[idx] = 1
+            elif (
+                config.char_list is not None
+                and item in config.char_list
+                and config.char_list.index(item) in syncope_set
+            ):
+                mask[idx] = 1
+    return mask
+
+
+def _create_optional_vowel_mask(
+    config: CtcSegmentationParameters,
+    ground_truth: Union[Sequence[Any], np.ndarray],
+    is_token_ids: bool = False,
+) -> np.ndarray:
+    """Deprecated alias for _create_syncope_mask."""
+    warnings.warn(
+        "_create_optional_vowel_mask is deprecated and will be removed in a future version. "
+        "Use _create_syncope_mask instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return _create_syncope_mask(config, ground_truth, is_token_ids=is_token_ids)
+
+
 @dataclass(frozen=True)
 class TrellisRuntimeContext:
     """Internal compiled runtime context passed to Cython core and backtracking.
@@ -379,6 +492,7 @@ class TrellisRuntimeContext:
         cls,
         config: CtcSegmentationParameters,
         ground_truth: np.ndarray,
+        is_syncope_token: Optional[Union[Sequence[Union[bool, int]], np.ndarray]] = None,
     ) -> "TrellisRuntimeContext":
         """Compile and validate user configuration into C-contiguous NumPy runtime arrays.
 
@@ -390,6 +504,7 @@ class TrellisRuntimeContext:
         Args:
             config: An instance of `CtcSegmentationParameters`.
             ground_truth: 2D label matrix of shape `(L, max_char_len)`.
+            is_syncope_token: Optional sequence or 1D mask override for syncope tokens.
 
         Returns:
             An immutable `TrellisRuntimeContext` instance containing compiled arrays.
@@ -402,8 +517,11 @@ class TrellisRuntimeContext:
         num_cols = ground_truth.shape[0]
 
         # 1. Compile syncope mask
-        if config.is_syncope_token is not None:
-            syncope_mask = np.ascontiguousarray(config.is_syncope_token, dtype=np.int8)
+        syncope_input = (
+            is_syncope_token if is_syncope_token is not None else config.is_syncope_token
+        )
+        if syncope_input is not None:
+            syncope_mask = np.ascontiguousarray(syncope_input, dtype=np.int8)
             if syncope_mask.ndim != 1 or syncope_mask.shape[0] != num_cols:
                 raise ValueError(
                     f"is_syncope_token length ({syncope_mask.shape[0]}) does not match "
@@ -413,23 +531,9 @@ class TrellisRuntimeContext:
             syncope_mask = np.zeros((0,), dtype=np.int8)
 
         # 2. Compile intrusive token IDs
-        intrusive_ids = []
-        if config.intrusive_tokens:
-            for token in config.intrusive_tokens:
-                if isinstance(token, str):
-                    if config.char_list is None or token not in config.char_list:
-                        raise ValueError(f"Intrusive token '{token}' not found in char_list")
-                    char_list_seq = (
-                        config.char_list
-                        if isinstance(config.char_list, list)
-                        else list(config.char_list)
-                    )
-                    intrusive_ids.append(char_list_seq.index(token))
-                elif isinstance(token, (int, np.integer)) and not isinstance(token, bool):
-                    intrusive_ids.append(int(token))
-                else:
-                    raise TypeError(f"Invalid intrusive token type: {type(token)}")
-        intrusive_token_ids = np.ascontiguousarray(np.array(intrusive_ids, dtype=np.int64))
+        intrusive_token_ids = np.ascontiguousarray(
+            _get_intrusive_token_ids(config), dtype=np.int64
+        )
         K = len(intrusive_token_ids)
 
         # 3. Compile per-token penalties
@@ -570,9 +674,6 @@ def ctc_segmentation(
         )
         is_syncope_token = is_optional_vowel
 
-    if is_syncope_token is not None:
-        config.is_syncope_token = is_syncope_token
-
     blank = config.blank
     offset = 0
     audio_duration = lpz.shape[0] * config.index_duration
@@ -584,7 +685,9 @@ def ctc_segmentation(
     if len(ground_truth) > lpz.shape[0] and config.skip_prob <= config.max_prob:
         raise AssertionError("Audio is shorter than text!")
 
-    runtime_ctx = TrellisRuntimeContext.compile(config, ground_truth)
+    runtime_ctx = TrellisRuntimeContext.compile(
+        config, ground_truth, is_syncope_token=is_syncope_token
+    )
 
     window_size = config.min_window_size
     # Try multiple window lengths if it fails
@@ -720,27 +823,27 @@ def ctc_segmentation(
                             continue
                         offset = offsets[c] - offsets[c - 1 - s]
                         for delta in range(0, min(runtime_ctx.intrusive_max_stride + 1, t - 1)):
-                                t_prev = t - 2 - delta + offset
-                                if 0 <= t_prev < table.shape[0]:
-                                    blank_sum = 0.0
-                                    for b_t in range(t - delta, t):
-                                        blank_sum += lpz[b_t + offsets[c], blank]
-                                    for j_idx, j in enumerate(runtime_ctx.intrusive_token_ids):
-                                        t_detour_frame = t - 1 - delta + offsets[c]
-                                        if lpz[t_detour_frame, j] >= runtime_ctx.intrusive_min_logprobs[j_idx]:
-                                            expected_p = (
-                                                table[t_prev, c - 1 - s]
-                                                + lpz[t_detour_frame, j]
-                                                - runtime_ctx.intrusive_penalties[j_idx]
-                                                + blank_sum
-                                                + lpz[t + offsets[c], ground_truth[c, s]]
-                                            )
-                                            diff = abs(table[t, c] - expected_p)
-                                            if diff < min_intrusive_delta:
-                                                min_intrusive_delta = diff
-                                                best_intrusive_j = j
-                                                best_intrusive_s = s
-                                                best_intrusive_stride = delta
+                            t_prev = t - 2 - delta + offset
+                            if 0 <= t_prev < table.shape[0]:
+                                blank_sum = 0.0
+                                for b_t in range(t - delta, t):
+                                    blank_sum += lpz[b_t + offsets[c], blank]
+                                for j_idx, j in enumerate(runtime_ctx.intrusive_token_ids):
+                                    t_detour_frame = t - 1 - delta + offsets[c]
+                                    if lpz[t_detour_frame, j] >= runtime_ctx.intrusive_min_logprobs[j_idx]:
+                                        expected_p = (
+                                            table[t_prev, c - 1 - s]
+                                            + lpz[t_detour_frame, j]
+                                            - runtime_ctx.intrusive_penalties[j_idx]
+                                            + blank_sum
+                                            + lpz[t + offsets[c], ground_truth[c, s]]
+                                        )
+                                        diff = abs(table[t, c] - expected_p)
+                                        if diff < min_intrusive_delta:
+                                            min_intrusive_delta = diff
+                                            best_intrusive_j = j
+                                            best_intrusive_s = s
+                                            best_intrusive_stride = delta
 
                 # Check which transition has been taken
                 if (
@@ -816,117 +919,6 @@ def ctc_segmentation(
             continue
         break
     return timings, char_probs, state_list
-
-
-def _create_syncope_mask(
-    config: CtcSegmentationParameters,
-    ground_truth: Union[Sequence[Any], np.ndarray],
-    is_token_ids: bool = False,
-) -> np.ndarray:
-    """Create a 1D int8 mask indicating syncope token positions in ground_truth."""
-    mask = np.zeros(len(ground_truth), dtype=np.int8)
-    tokens = config.syncope_tokens
-    if tokens is None:
-        return mask
-    syncope_set = set(tokens)
-    for idx, item in enumerate(ground_truth):
-        if is_token_ids:
-            if item in syncope_set:
-                mask[idx] = 1
-            elif (
-                config.char_list is not None
-                and isinstance(item, (int, np.integer))
-                and 0 <= item < len(config.char_list)
-                and config.char_list[item] in syncope_set
-            ):
-                mask[idx] = 1
-        else:
-            if item in syncope_set:
-                mask[idx] = 1
-            elif (
-                config.char_list is not None
-                and item in config.char_list
-                and config.char_list.index(item) in syncope_set
-            ):
-                mask[idx] = 1
-    return mask
-
-
-def _create_optional_vowel_mask(
-    config: CtcSegmentationParameters,
-    ground_truth: Union[Sequence[Any], np.ndarray],
-    is_token_ids: bool = False,
-) -> np.ndarray:
-    """Deprecated alias for _create_syncope_mask."""
-    warnings.warn(
-        "_create_optional_vowel_mask is deprecated and will be removed in a future version. "
-        "Use _create_syncope_mask instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return _create_syncope_mask(config, ground_truth, is_token_ids=is_token_ids)
-
-
-def _parse_intrusive_token_ids(
-    tokens: Optional[Sequence[Union[str, int]]],
-    char_list: Optional[Union[List[str], Tuple[str, ...], Set[str], Sequence[str]]] = None,
-) -> List[int]:
-    """Parse and validate intrusive token specifications (strings or integer IDs)."""
-    if tokens is None:
-        return []
-    c_list = list(char_list) if char_list is not None else None
-    token_ids = []
-    for t_item in tokens:
-        if isinstance(t_item, str):
-            if c_list is not None and t_item in c_list:
-                token_ids.append(c_list.index(t_item))
-            else:
-                raise ValueError(f"Intrusive token '{t_item}' not found in char_list")
-        elif isinstance(t_item, (int, np.integer)):
-            t_int = int(t_item)
-            if c_list is not None and not (0 <= t_int < len(c_list)):
-                raise ValueError(
-                    f"Intrusive token id {t_int} out of range for char_list of length {len(c_list)}"
-                )
-            if t_int < 0:
-                raise ValueError(
-                    f"Intrusive token id must be non-negative, got {t_int}"
-                )
-            token_ids.append(t_int)
-        else:
-            raise TypeError(f"Unsupported intrusive token type: {type(t_item)}")
-    return token_ids
-
-
-def _create_intrusive_mask(
-    config: CtcSegmentationParameters,
-    char_list: Optional[Sequence[str]] = None,
-) -> Optional[np.ndarray]:
-    """Create a 1D int8 mask indicating intrusive token indices in vocabulary (char_list)."""
-    c_list = char_list if char_list is not None else config.char_list
-    if config.intrusive_tokens is None or c_list is None:
-        return None
-    ids = _parse_intrusive_token_ids(config.intrusive_tokens, c_list)
-    mask = np.zeros(len(c_list), dtype=np.int8)
-    for idx in ids:
-        mask[idx] = 1
-    return mask
-
-
-def _get_intrusive_token_ids(
-    config: CtcSegmentationParameters,
-) -> np.ndarray:
-    """Extract and validate intrusive token IDs from configuration."""
-    if config.intrusive_tokens is not None:
-        token_ids = _parse_intrusive_token_ids(
-            config.intrusive_tokens, config.char_list
-        )
-        return np.array(token_ids, dtype=np.int64)
-    elif config.is_intrusive_token is not None:
-        return np.where(
-            np.asarray(config.is_intrusive_token, dtype=np.int8) == 1
-        )[0].astype(np.int64)
-    return np.zeros(0, dtype=np.int64)
 
 
 def prepare_text(

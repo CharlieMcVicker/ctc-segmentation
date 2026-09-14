@@ -68,7 +68,7 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
     cdef np.ndarray[np.int64_t, ndim=1] cur_offset = np.zeros([ground_truth.shape[1]], np.int64) - 1
     cdef float max_lpz_prob
     cdef float p, v_prob, p_cand, blank_sum, base_prob
-    cdef int s, c_prev, delta_offset, t_prev, j_idx, j, delta, b_t, t_detour, has_candidate
+    cdef int s, delta_offset, t_prev, j_idx, j, delta, b_t, t_detour, has_candidate
     cdef int num_intrusive_tokens = intrusive_token_ids.shape[0]
     cdef int stay_transition_cost_zero
     cdef int preamble_transition_cost_zero
