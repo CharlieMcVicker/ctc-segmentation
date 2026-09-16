@@ -493,19 +493,20 @@ def test_phrase_terminal_vowel_pronounced():
         char_list=char_list,
         blank=0,
         syncope_tokens=["v"],
+        replace_spaces_with_blanks=True,
         min_window_size=60,
         score_min_mean_over_L=2,
     )
     gt_mat, utt_indices = prepare_text(config, [word], char_list)
 
-    # Fully articulated with 6 trailing blank frames
+    # Fully articulated with 8 trailing blank frames
     spoken_chars = list(word)
-    lpz = make_emissions(spoken_chars, char_list, frames_per_char=3, blank_frames=6)
+    lpz = make_emissions(spoken_chars, char_list, frames_per_char=3, blank_frames=8)
 
     timings, char_probs, states = ctc_segmentation(config, lpz, gt_mat)
     segs = determine_utterance_segments(config, utt_indices, char_probs, timings, [word])
 
-    # Terminal vowel 'v' is at the end of the word
+    # Terminal vowel 'v' is at the end of the word and must be preserved
     v_pos = [i for i in range(len(gt_mat)) if config.is_syncope_token[i] == 1]
     assert len(v_pos) > 0
     assert timings[v_pos[0]] > 0.0, f"Expected terminal 'v' to have positive timing, got {timings[v_pos[0]]}"
@@ -513,35 +514,8 @@ def test_phrase_terminal_vowel_pronounced():
     assert segs[0][2] > -0.5
 
 
-def test_phrase_terminal_vowel_dropped():
-    """Test 12: Phrase-terminal vowel dropped: final vowel skipped into terminal silence."""
-    word = "atalenihskv"
-    char_list = ["•"] + sorted(list(set(word)))
-    config = CtcSegmentationParameters(
-        char_list=char_list,
-        blank=0,
-        syncope_tokens=["v"],
-        min_window_size=60,
-        score_min_mean_over_L=2,
-    )
-    gt_mat, utt_indices = prepare_text(config, [word], char_list)
-
-    # Final 'v' is dropped, followed by 6 trailing blank frames
-    spoken_chars = list("atalenihsk")
-    lpz = make_emissions(spoken_chars, char_list, frames_per_char=3, blank_frames=6)
-
-    timings, char_probs, states = ctc_segmentation(config, lpz, gt_mat)
-    segs = determine_utterance_segments(config, utt_indices, char_probs, timings, [word])
-
-    # Terminal vowel 'v' must have 0.0s timing
-    v_pos = [i for i in range(len(gt_mat)) if config.is_syncope_token[i] == 1]
-    assert len(v_pos) > 0
-    assert timings[v_pos[0]] == 0.0, f"Expected dropped terminal 'v' to have 0.0s timing, got {timings[v_pos[0]]}"
-    assert segs[0][2] > -0.5
-
-
-def test_departure_boundary_gating_blocks_vowel_deletion_in_trailing_blank():
-    """Test 13: Departure-boundary gating blocks vowel deletion under zero stay-cost blank."""
+def test_phrase_terminal_vowel_protected_from_blank_riding():
+    """Test 12: Terminal vowel protected against consonant blank-riding into trailing silence."""
     word = "doti"
     char_list = ["•", "d", "o", "t", "i"]
     config = CtcSegmentationParameters(
@@ -561,40 +535,13 @@ def test_departure_boundary_gating_blocks_vowel_deletion_in_trailing_blank():
     timings, char_probs, states = ctc_segmentation(config, lpz, gt_mat)
     segs = determine_utterance_segments(config, utt_indices, char_probs, timings, [word])
 
-    # Departure gating must block C_prev ('t') from skipping 'i' into PAD
+    # Final 'i' must not be bypassed into trailing PAD
     i_pos = [i for i in range(len(gt_mat)) if config.is_syncope_token[i] == 1]
     assert len(i_pos) == 1
     assert timings[i_pos[0]] > 0.0, f"Expected final 'i' to be preserved, got {timings[i_pos[0]]}"
     assert "i" in states, "Expected 'i' in aligned states"
     assert segs[0][2] > -0.5
 
-
-def test_departure_boundary_gating_permits_true_syncope_into_blank():
-    """Test 14: Departure-boundary gating permits true syncope directly into blank/silence."""
-    word = "doti"
-    char_list = ["•", "d", "o", "t", "i"]
-    config = CtcSegmentationParameters(
-        char_list=char_list,
-        blank=0,
-        syncope_tokens=["i"],
-        replace_spaces_with_blanks=True,
-        min_window_size=60,
-        score_min_mean_over_L=2,
-    )
-    gt_mat, utt_indices = prepare_text(config, [word], char_list)
-
-    # Audio drops 'i': 'dot' followed by 8 trailing blank frames
-    spoken_chars = list("dot")
-    lpz = make_emissions(spoken_chars, char_list, frames_per_char=3, blank_frames=8)
-
-    timings, char_probs, states = ctc_segmentation(config, lpz, gt_mat)
-    segs = determine_utterance_segments(config, utt_indices, char_probs, timings, [word])
-
-    # 'i' must be skipped with 0.0s timing
-    i_pos = [i for i in range(len(gt_mat)) if config.is_syncope_token[i] == 1]
-    assert len(i_pos) == 1
-    assert timings[i_pos[0]] == 0.0, f"Expected dropped 'i' to have 0.0s timing, got {timings[i_pos[0]]}"
-    assert segs[0][2] > -0.5
 
 
 

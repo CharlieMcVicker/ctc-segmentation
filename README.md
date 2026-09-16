@@ -238,7 +238,7 @@ $$\text{Gate}_{\text{syncope}}(t, c) = \begin{cases} \text{OPEN}, & \text{if } \
 
 When open, evaluate the transition with zero penalty ($\lambda_{\text{syncope}} = 0.0$):
 
-* **Case A: Immediate Syncope Vowel ($c - 1$ is syncope token, $c_{\text{vowel}} = c - 1$, anchor is non-blank $L(c, s) \ne \text{blank}$)**
+* **Case A: Immediate Syncope Vowel ($c - 1$ is syncope token, $c_{\text{vowel}} = c - 1$, anchor is non-blank phoneme $L(c, s) \ne \text{blank}$)**
   1. *Direct 1-token skip ($c - 2 \to c$):*
      $$P_{\text{sync}, 1}(t, c) = \text{table}[t - 1 + \text{offset}(c, c - 2), c - 2] + \text{lpz}[t + \text{offset\_sum}, L(c, s)]$$
   2. *Blank-mediated 2-token skip ($c - 3 \to c$):*
@@ -255,18 +255,6 @@ When open, evaluate the transition with zero penalty ($\lambda_{\text{syncope}} 
      Permitted **only if** $c \ge 4$ and state $c - 3$ is a CTC blank/PAD token ($L(c - 3, 0) \in \{\text{blank}, -1\}$):
      $$P_{\text{sync}, 4}(t, c) = \begin{cases}
      \text{table}[t - 1 + \text{offset}(c, c - 4), c - 4] + \text{lpz}[t + \text{offset\_sum}, L(c, s)] & \text{if } L(c - 3, 0) \in \{\text{blank}, -1\} \\
-     -\infty & \text{otherwise}
-     \end{cases}$$
-
-* **Case C: Syncope Directly into Blank ($L(c, s) = \text{blank}$, Phrase-Terminal or Inter-Word Pause)**
-  When transitioning into a blank state $c$, the skip is gated at the **departure frame** $t_{\text{dep}} = t_{\text{prev}} + 1 + \text{offset}(c_{\text{prev}})$ (the immediate frame where $C_{\text{prev}}$ was exited):
-  $$\text{Gate}_{\text{dep}}(t, c) = \begin{cases} \text{OPEN}, & \text{if } \text{lpz}[t_{\text{dep}}, \text{blank}] > \text{lpz}[t_{\text{dep}}, V_{\text{final}}] \\ \text{CLOSED}, & \text{otherwise} \end{cases}$$
-  1. *Direct skip over final vowel into blank ($c - 2 \to c$):*
-     $$P_{\text{sync}, 5}(t, c) = \text{table}[t - 1 + \text{offset}(c, c - 2), c - 2] + \text{lpz}[t + \text{offset\_sum}, \text{blank}]$$
-  2. *Blank-mediated skip ($c - 3 \to c$):*
-     Permitted **only if** $c \ge 3$ and state $c - 2$ is a CTC blank/PAD token ($L(c - 2, 0) \in \{\text{blank}, -1\}$):
-     $$P_{\text{sync}, 6}(t, c) = \begin{cases}
-     \text{table}[t - 1 + \text{offset}(c, c - 3), c - 3] + \text{lpz}[t + \text{offset\_sum}, \text{blank}] & \text{if } L(c - 2, 0) \in \{\text{blank}, -1\} \\
      -\infty & \text{otherwise}
      \end{cases}$$
 
