@@ -663,12 +663,44 @@ def ctc_segmentation(
                                         candidates.append(c - 3)
                                         if c >= 4 and (ground_truth[c - 3, 0] == blank or ground_truth[c - 3, 0] == -1):
                                             candidates.append(c - 4)
-                            elif c == table.shape[1] - 1:
-                                # Phrase-terminal PAD likelihood competition
+                            elif c == table.shape[1] - 1 or anchor_tok == blank:
+                                # Syncope directly into blank with departure-boundary contrastive gating
                                 if runtime_ctx.is_syncope_token[c - 1] == 1:
-                                    candidates.append(c - 2)
+                                    vowel_tok = ground_truth[c - 1, 0]
+                                    # 1. Direct skip (c - 2 -> c)
+                                    delta_offset = offsets[c] - offsets[c - 2]
+                                    t_prev = t - 1 + delta_offset
+                                    if 0 <= t_prev < table.shape[0]:
+                                        t_dep = t_prev + 1 + offsets[c - 2]
+                                        if 0 <= t_dep < lpz.shape[0] and lpz[t_dep, blank] > lpz[t_dep, vowel_tok]:
+                                            candidates.append(c - 2)
+                                    # 2. 2-token skip (c - 3 -> c)
                                     if c >= 3 and (ground_truth[c - 2, 0] == blank or ground_truth[c - 2, 0] == -1):
-                                        candidates.append(c - 3)
+                                        delta_offset = offsets[c] - offsets[c - 3]
+                                        t_prev = t - 1 + delta_offset
+                                        if 0 <= t_prev < table.shape[0]:
+                                            t_dep = t_prev + 1 + offsets[c - 3]
+                                            if 0 <= t_dep < lpz.shape[0] and lpz[t_dep, blank] > lpz[t_dep, vowel_tok]:
+                                                candidates.append(c - 3)
+                                elif (
+                                    c >= 3
+                                    and (ground_truth[c - 1, 0] == blank or ground_truth[c - 1, 0] == -1)
+                                    and runtime_ctx.is_syncope_token[c - 2] == 1
+                                ):
+                                    vowel_tok = ground_truth[c - 2, 0]
+                                    delta_offset = offsets[c] - offsets[c - 3]
+                                    t_prev = t - 1 + delta_offset
+                                    if 0 <= t_prev < table.shape[0]:
+                                        t_dep = t_prev + 1 + offsets[c - 3]
+                                        if 0 <= t_dep < lpz.shape[0] and lpz[t_dep, blank] > lpz[t_dep, vowel_tok]:
+                                            candidates.append(c - 3)
+                                    if c >= 4 and (ground_truth[c - 3, 0] == blank or ground_truth[c - 3, 0] == -1):
+                                        delta_offset = offsets[c] - offsets[c - 4]
+                                        t_prev = t - 1 + delta_offset
+                                        if 0 <= t_prev < table.shape[0]:
+                                            t_dep = t_prev + 1 + offsets[c - 4]
+                                            if 0 <= t_dep < lpz.shape[0] and lpz[t_dep, blank] > lpz[t_dep, vowel_tok]:
+                                                candidates.append(c - 4)
 
                             for c_prev in candidates:
                                 delta_offset = offsets[c] - offsets[c_prev]

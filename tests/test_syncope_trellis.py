@@ -540,5 +540,63 @@ def test_phrase_terminal_vowel_dropped():
     assert segs[0][2] > -0.5
 
 
+def test_departure_boundary_gating_blocks_vowel_deletion_in_trailing_blank():
+    """Test 13: Departure-boundary gating blocks vowel deletion under zero stay-cost blank."""
+    word = "doti"
+    char_list = ["•", "d", "o", "t", "i"]
+    config = CtcSegmentationParameters(
+        char_list=char_list,
+        blank=0,
+        syncope_tokens=["i"],
+        replace_spaces_with_blanks=True,  # Enables stay_transition_cost_zero
+        min_window_size=60,
+        score_min_mean_over_L=2,
+    )
+    gt_mat, utt_indices = prepare_text(config, [word], char_list)
+
+    # Audio has full 'doti' followed by 8 trailing blank frames
+    spoken_chars = list("doti")
+    lpz = make_emissions(spoken_chars, char_list, frames_per_char=3, blank_frames=8)
+
+    timings, char_probs, states = ctc_segmentation(config, lpz, gt_mat)
+    segs = determine_utterance_segments(config, utt_indices, char_probs, timings, [word])
+
+    # Departure gating must block C_prev ('t') from skipping 'i' into PAD
+    i_pos = [i for i in range(len(gt_mat)) if config.is_syncope_token[i] == 1]
+    assert len(i_pos) == 1
+    assert timings[i_pos[0]] > 0.0, f"Expected final 'i' to be preserved, got {timings[i_pos[0]]}"
+    assert "i" in states, "Expected 'i' in aligned states"
+    assert segs[0][2] > -0.5
+
+
+def test_departure_boundary_gating_permits_true_syncope_into_blank():
+    """Test 14: Departure-boundary gating permits true syncope directly into blank/silence."""
+    word = "doti"
+    char_list = ["•", "d", "o", "t", "i"]
+    config = CtcSegmentationParameters(
+        char_list=char_list,
+        blank=0,
+        syncope_tokens=["i"],
+        replace_spaces_with_blanks=True,
+        min_window_size=60,
+        score_min_mean_over_L=2,
+    )
+    gt_mat, utt_indices = prepare_text(config, [word], char_list)
+
+    # Audio drops 'i': 'dot' followed by 8 trailing blank frames
+    spoken_chars = list("dot")
+    lpz = make_emissions(spoken_chars, char_list, frames_per_char=3, blank_frames=8)
+
+    timings, char_probs, states = ctc_segmentation(config, lpz, gt_mat)
+    segs = determine_utterance_segments(config, utt_indices, char_probs, timings, [word])
+
+    # 'i' must be skipped with 0.0s timing
+    i_pos = [i for i in range(len(gt_mat)) if config.is_syncope_token[i] == 1]
+    assert len(i_pos) == 1
+    assert timings[i_pos[0]] == 0.0, f"Expected dropped 'i' to have 0.0s timing, got {timings[i_pos[0]]}"
+    assert segs[0][2] > -0.5
+
+
+
 
 
