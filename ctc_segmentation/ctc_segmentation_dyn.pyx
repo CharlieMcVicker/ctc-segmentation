@@ -22,10 +22,7 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                       np.ndarray[np.int64_t, ndim=2] ground_truth,
                       np.ndarray[np.int64_t, ndim=1] offsets,
                       np.ndarray[np.int8_t, ndim=1] is_syncope_token,
-                      float syncope_penalty,
                       np.ndarray[np.int64_t, ndim=1] intrusive_token_ids,
-                      np.ndarray[np.float32_t, ndim=1] intrusive_penalties,
-                      np.ndarray[np.float32_t, ndim=1] intrusive_min_logprobs,
                       np.ndarray[np.int8_t, ndim=1] is_intrusive_site,
                       int intrusive_max_stride,
                       int blank,
@@ -34,8 +31,8 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
 
     Supports blank-constrained syncope skip transitions (enforcing the Consonant
     Preservation Invariant and Blank-Only Stride Invariants for Case A and Case B)
-    and blank-tolerant intrusive token detours with acoustic log-probability gating
-    and per-token penalties.
+    and blank-tolerant intrusive token detours with unified Relative Contrastive
+    Acoustic Gating (zero hyperparameter runtime).
 
     :param table: table filled with maximum joint probabilities k_{t,j}
     :param lpz: character probabilities of each time frame
@@ -44,10 +41,7 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
     :param is_syncope_token: 1D mask array marking optional syncope token positions
         for blank-constrained syncope transitions (enforces the blank-only stride
         invariant so non-syncope characters/consonants are preserved).
-    :param syncope_penalty: penalty subtracted for syncope skip transition
     :param intrusive_token_ids: 1D array of token IDs eligible for intrusive insertion
-    :param intrusive_penalties: 1D array of penalties subtracted per intrusive token
-    :param intrusive_min_logprobs: 1D array of posterior log-probability thresholds per intrusive token
     :param is_intrusive_site: 1D mask array gating allowed intrusive detour transition sites
     :param intrusive_max_stride: maximum blank frame stride for intrusive transitions
     :param blank: label ID of the blank symbol, usually 0
@@ -69,6 +63,7 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
     cdef float max_lpz_prob
     cdef float p, v_prob, p_cand, blank_sum, base_prob
     cdef int s, delta_offset, t_prev, j_idx, j, delta, b_t, t_detour, has_candidate
+    cdef int anchor_tok, vowel_tok
     cdef int num_intrusive_tokens = intrusive_token_ids.shape[0]
     cdef int stay_transition_cost_zero
     cdef int preamble_transition_cost_zero
@@ -113,50 +108,57 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                     switch_prob = max(switch_prob, p)
                     max_lpz_prob = max(max_lpz_prob, lpz[t + offset_sum, ground_truth[c, s]])
 
-            # Compute syncope skip probability with blank-constrained stride
+            # Compute syncope skip probability with relative contrastive gating
             syncope_skip_prob = prob_max
             if is_syncope_token.shape[0] > 0 and c >= 2:
                 for s in range(ground_truth.shape[1]):
                     if ground_truth[c, s] != -1:
+                        anchor_tok = ground_truth[c, s]
                         # Case A: c - 1 is a syncope token
                         if is_syncope_token[c - 1] == 1:
-                            # 1. Direct 1-token skip over syncope vowel (c - 2 -> c)
-                            delta_offset = offset_sum - offsets[c - 2]
-                            t_prev = t - 1 + delta_offset
-                            if 0 <= t_prev < table.shape[0]:
-                                v_prob = table[t_prev, c - 2] + lpz[t + offset_sum, ground_truth[c, s]] - syncope_penalty
-                                if v_prob > syncope_skip_prob:
-                                    syncope_skip_prob = v_prob
-
-                            # 2. 2-token skip (c - 3 -> c) ONLY IF c - 2 is a blank/PAD
-                            if c >= 3 and (ground_truth[c - 2, 0] == blank or ground_truth[c - 2, 0] == -1):
-                                delta_offset = offset_sum - offsets[c - 3]
+                            vowel_tok = ground_truth[c - 1, 0]
+                            # Gate: acoustics at arrival frame must favor anchor over skipped vowel
+                            if lpz[t + offset_sum, anchor_tok] > lpz[t + offset_sum, vowel_tok]:
+                                # 1. Direct 1-token skip over syncope vowel (c - 2 -> c)
+                                delta_offset = offset_sum - offsets[c - 2]
                                 t_prev = t - 1 + delta_offset
                                 if 0 <= t_prev < table.shape[0]:
-                                    v_prob = table[t_prev, c - 3] + lpz[t + offset_sum, ground_truth[c, s]] - syncope_penalty
+                                    v_prob = table[t_prev, c - 2] + lpz[t + offset_sum, anchor_tok]
                                     if v_prob > syncope_skip_prob:
                                         syncope_skip_prob = v_prob
+
+                                # 2. 2-token skip (c - 3 -> c) ONLY IF c - 2 is a blank/PAD
+                                if c >= 3 and (ground_truth[c - 2, 0] == blank or ground_truth[c - 2, 0] == -1):
+                                    delta_offset = offset_sum - offsets[c - 3]
+                                    t_prev = t - 1 + delta_offset
+                                    if 0 <= t_prev < table.shape[0]:
+                                        v_prob = table[t_prev, c - 3] + lpz[t + offset_sum, anchor_tok]
+                                        if v_prob > syncope_skip_prob:
+                                            syncope_skip_prob = v_prob
 
                         # Case B: c - 2 is syncope token and c - 1 is a blank/space
                         elif c >= 3 and is_syncope_token[c - 2] == 1 and (ground_truth[c - 1, 0] == blank or ground_truth[c - 1, 0] == -1):
-                            # 1. Skip vowel + trailing blank (c - 3 -> c)
-                            delta_offset = offset_sum - offsets[c - 3]
-                            t_prev = t - 1 + delta_offset
-                            if 0 <= t_prev < table.shape[0]:
-                                v_prob = table[t_prev, c - 3] + lpz[t + offset_sum, ground_truth[c, s]] - syncope_penalty
-                                if v_prob > syncope_skip_prob:
-                                    syncope_skip_prob = v_prob
-
-                            # 2. Skip leading blank + vowel + trailing blank (c - 4 -> c) ONLY IF c - 3 is blank
-                            if c >= 4 and (ground_truth[c - 3, 0] == blank or ground_truth[c - 3, 0] == -1):
-                                delta_offset = offset_sum - offsets[c - 4]
+                            vowel_tok = ground_truth[c - 2, 0]
+                            # Gate: acoustics at arrival frame must favor anchor over skipped vowel
+                            if lpz[t + offset_sum, anchor_tok] > lpz[t + offset_sum, vowel_tok]:
+                                # 1. Skip vowel + trailing blank (c - 3 -> c)
+                                delta_offset = offset_sum - offsets[c - 3]
                                 t_prev = t - 1 + delta_offset
                                 if 0 <= t_prev < table.shape[0]:
-                                    v_prob = table[t_prev, c - 4] + lpz[t + offset_sum, ground_truth[c, s]] - syncope_penalty
+                                    v_prob = table[t_prev, c - 3] + lpz[t + offset_sum, anchor_tok]
                                     if v_prob > syncope_skip_prob:
                                         syncope_skip_prob = v_prob
 
-            # Compute intrusive detour probability with blank-stride tolerance and acoustic gating
+                                # 2. Skip leading blank + vowel + trailing blank (c - 4 -> c) ONLY IF c - 3 is blank
+                                if c >= 4 and (ground_truth[c - 3, 0] == blank or ground_truth[c - 3, 0] == -1):
+                                    delta_offset = offset_sum - offsets[c - 4]
+                                    t_prev = t - 1 + delta_offset
+                                    if 0 <= t_prev < table.shape[0]:
+                                        v_prob = table[t_prev, c - 4] + lpz[t + offset_sum, anchor_tok]
+                                        if v_prob > syncope_skip_prob:
+                                            syncope_skip_prob = v_prob
+
+            # Compute intrusive detour probability with blank-stride tolerance and relative contrastive gating
             intrusive_prob = prob_max
             if (
                 num_intrusive_tokens > 0
@@ -167,16 +169,17 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                 for s in range(ground_truth.shape[1]):
                     if ground_truth[c, s] == -1 or c - 1 - s < 0:
                         continue
+                    anchor_tok = ground_truth[c, s]
                     delta_offset = offset_sum - offsets[c - 1 - s]
                     for delta in range(0, min(intrusive_max_stride + 1, t - 1)):
                         t_prev = t - 2 - delta + delta_offset
                         if 0 <= t_prev < table.shape[0]:
                             t_detour = t - 1 - delta + offset_sum
 
-                            # Fast early-exit: check if any candidate satisfies threshold
+                            # Fast early-exit: check if any candidate has relative contrast advantage over target anchor
                             has_candidate = 0
                             for j_idx in range(num_intrusive_tokens):
-                                if lpz[t_detour, intrusive_token_ids[j_idx]] >= intrusive_min_logprobs[j_idx]:
+                                if lpz[t_detour, intrusive_token_ids[j_idx]] > lpz[t_detour, anchor_tok]:
                                     has_candidate = 1
                                     break
                             if not has_candidate:
@@ -188,12 +191,12 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                             base_prob = (
                                 table[t_prev, c - 1 - s]
                                 + blank_sum
-                                + lpz[t + offset_sum, ground_truth[c, s]]
+                                + lpz[t + offset_sum, anchor_tok]
                             )
                             for j_idx in range(num_intrusive_tokens):
                                 j = intrusive_token_ids[j_idx]
-                                if lpz[t_detour, j] >= intrusive_min_logprobs[j_idx]:
-                                    p_cand = base_prob + lpz[t_detour, j] - intrusive_penalties[j_idx]
+                                if lpz[t_detour, j] > lpz[t_detour, anchor_tok]:
+                                    p_cand = base_prob + lpz[t_detour, j]
                                     if p_cand > intrusive_prob:
                                         intrusive_prob = p_cand
 
