@@ -326,7 +326,7 @@ def _parse_intrusive_token_ids(
             token_ids.append(t_int)
         else:
             raise TypeError(
-                f"Invalid intrusive token type: Unsupported intrusive token type: {type(t_item)}"
+                f"Unsupported intrusive token type: {type(t_item).__name__}"
             )
     return token_ids
 
@@ -642,25 +642,13 @@ def ctc_segmentation(
                     for s in range(ground_truth.shape[1]):
                         if ground_truth[c, s] != -1:
                             anchor_tok = ground_truth[c, s]
+                            candidates = []
                             if runtime_ctx.is_syncope_token[c - 1] == 1:
                                 vowel_tok = ground_truth[c - 1, 0]
                                 if lpz[t + offsets[c], anchor_tok] > lpz[t + offsets[c], vowel_tok]:
-                                    # Valid candidate predecessors
-                                    candidates = [c - 2]
+                                    candidates.append(c - 2)
                                     if c >= 3 and (ground_truth[c - 2, 0] == blank or ground_truth[c - 2, 0] == -1):
                                         candidates.append(c - 3)
-
-                                    for c_prev in candidates:
-                                        delta_offset = offsets[c] - offsets[c_prev]
-                                        t_prev = t - 1 + delta_offset
-                                        if 0 <= t_prev < table.shape[0]:
-                                            est_v_prob = table[t, c] - table[t_prev, c_prev]
-                                            expected_v_prob = lpz[t + offsets[c], anchor_tok]
-                                            v_delta = abs(est_v_prob - expected_v_prob)
-                                            if v_delta < min_syncope_skip_delta:
-                                                min_syncope_skip_delta = v_delta
-                                                best_syncope_c_prev = c_prev
-                                                best_syncope_s = s
                             elif (
                                 c >= 3
                                 and runtime_ctx.is_syncope_token[c - 2] == 1
@@ -671,21 +659,21 @@ def ctc_segmentation(
                             ):
                                 vowel_tok = ground_truth[c - 2, 0]
                                 if lpz[t + offsets[c], anchor_tok] > lpz[t + offsets[c], vowel_tok]:
-                                    candidates = [c - 3]
+                                    candidates.append(c - 3)
                                     if c >= 4 and (ground_truth[c - 3, 0] == blank or ground_truth[c - 3, 0] == -1):
                                         candidates.append(c - 4)
 
-                                    for c_prev in candidates:
-                                        delta_offset = offsets[c] - offsets[c_prev]
-                                        t_prev = t - 1 + delta_offset
-                                        if 0 <= t_prev < table.shape[0]:
-                                            est_v_prob = table[t, c] - table[t_prev, c_prev]
-                                            expected_v_prob = lpz[t + offsets[c], anchor_tok]
-                                            v_delta = abs(est_v_prob - expected_v_prob)
-                                            if v_delta < min_syncope_skip_delta:
-                                                min_syncope_skip_delta = v_delta
-                                                best_syncope_c_prev = c_prev
-                                                best_syncope_s = s
+                            for c_prev in candidates:
+                                delta_offset = offsets[c] - offsets[c_prev]
+                                t_prev = t - 1 + delta_offset
+                                if 0 <= t_prev < table.shape[0]:
+                                    est_v_prob = table[t, c] - table[t_prev, c_prev]
+                                    expected_v_prob = lpz[t + offsets[c], anchor_tok]
+                                    v_delta = abs(est_v_prob - expected_v_prob)
+                                    if v_delta < min_syncope_skip_delta:
+                                        min_syncope_skip_delta = v_delta
+                                        best_syncope_c_prev = c_prev
+                                        best_syncope_s = s
 
                 # Check intrusive detour transitions with relative contrastive gating
                 min_intrusive_delta = np.inf
@@ -983,7 +971,7 @@ def determine_utterance_segments(
         return middle
 
     segments = []
-    min_prob = np.float64(-10000000000.0)
+    min_prob = np.float64(config.max_prob)
     for i in range(len(text)):
         start = compute_time(utt_begin_indices[i], "begin")
         end = compute_time(utt_begin_indices[i + 1], "end")

@@ -46,7 +46,7 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
     :param intrusive_max_stride: maximum blank frame stride for intrusive transitions
     :param blank: label ID of the blank symbol, usually 0
     :param flags: configuration options, default 0
-    :return:
+    :return: Tuple (t, c) containing the frame index and column index of the maximum probability state in the terminal column.
     """
     cdef int c
     cdef int t
@@ -56,7 +56,7 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
     cdef int lower_offset
     cdef int higher_offset
     cdef float switch_prob, stay_prob, skip_prob, syncope_skip_prob, intrusive_prob
-    cdef float prob_max = -1000000000
+    cdef float prob_floor = -1000000000
     cdef float last_max
     cdef int last_arg_max
     cdef np.ndarray[np.int64_t, ndim=1] cur_offset = np.zeros([ground_truth.shape[1]], np.int64) - 1
@@ -97,19 +97,19 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
         # Go through all rows of the current column
         for t in range((1 if c == 0 else 0), table.shape[0]):
             # Compute max switch probability
-            switch_prob = prob_max
-            max_lpz_prob = prob_max
+            switch_prob = prob_floor
+            max_lpz_prob = prob_floor
             for s in range(ground_truth.shape[1]):
                 if ground_truth[c, s] != -1:
                     if t >= table.shape[0] - (cur_offset[s] - 1) or t - 1 + cur_offset[s] < 0 or c == 0:
-                        p = prob_max
+                        p = prob_floor
                     else:
                         p = table[t - 1 + cur_offset[s], c - (s + 1)] + lpz[t + offset_sum, ground_truth[c, s]]
                     switch_prob = max(switch_prob, p)
                     max_lpz_prob = max(max_lpz_prob, lpz[t + offset_sum, ground_truth[c, s]])
 
             # Compute syncope skip probability with relative contrastive gating
-            syncope_skip_prob = prob_max
+            syncope_skip_prob = prob_floor
             if is_syncope_token.shape[0] > 0 and c >= 2:
                 for s in range(ground_truth.shape[1]):
                     if ground_truth[c, s] != -1:
@@ -159,7 +159,7 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                                             syncope_skip_prob = v_prob
 
             # Compute intrusive detour probability with blank-stride tolerance and relative contrastive gating
-            intrusive_prob = prob_max
+            intrusive_prob = prob_floor
             if (
                 num_intrusive_tokens > 0
                 and c >= 1
@@ -202,7 +202,7 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
 
             # Compute stay probability
             if t - 1 < 0:
-                stay_prob = prob_max
+                stay_prob = prob_floor
             elif preamble_transition_cost_zero:
                 stay_prob = 0
             elif stay_transition_cost_zero:

@@ -529,7 +529,7 @@ def test_trellis_runtime_context_compile_type_errors():
         char_list=["•", "a"],
         intrusive_tokens=[3.14],
     )
-    with pytest.raises(TypeError, match="Invalid intrusive token type"):
+    with pytest.raises(TypeError, match="Unsupported intrusive token type"):
         TrellisRuntimeContext.compile(config_invalid_token, ground_truth)
 
 
