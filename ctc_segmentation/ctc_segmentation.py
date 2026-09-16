@@ -643,25 +643,32 @@ def ctc_segmentation(
                         if ground_truth[c, s] != -1:
                             anchor_tok = ground_truth[c, s]
                             candidates = []
-                            if runtime_ctx.is_syncope_token[c - 1] == 1:
-                                vowel_tok = ground_truth[c - 1, 0]
-                                if lpz[t + offsets[c], anchor_tok] > lpz[t + offsets[c], vowel_tok]:
+                            if anchor_tok != blank:
+                                if runtime_ctx.is_syncope_token[c - 1] == 1:
+                                    vowel_tok = ground_truth[c - 1, 0]
+                                    if lpz[t + offsets[c], anchor_tok] > lpz[t + offsets[c], vowel_tok]:
+                                        candidates.append(c - 2)
+                                        if c >= 3 and (ground_truth[c - 2, 0] == blank or ground_truth[c - 2, 0] == -1):
+                                            candidates.append(c - 3)
+                                elif (
+                                    c >= 3
+                                    and runtime_ctx.is_syncope_token[c - 2] == 1
+                                    and (
+                                        ground_truth[c - 1, 0] == blank
+                                        or ground_truth[c - 1, 0] == -1
+                                    )
+                                ):
+                                    vowel_tok = ground_truth[c - 2, 0]
+                                    if lpz[t + offsets[c], anchor_tok] > lpz[t + offsets[c], vowel_tok]:
+                                        candidates.append(c - 3)
+                                        if c >= 4 and (ground_truth[c - 3, 0] == blank or ground_truth[c - 3, 0] == -1):
+                                            candidates.append(c - 4)
+                            elif c == table.shape[1] - 1:
+                                # Phrase-terminal PAD likelihood competition
+                                if runtime_ctx.is_syncope_token[c - 1] == 1:
                                     candidates.append(c - 2)
                                     if c >= 3 and (ground_truth[c - 2, 0] == blank or ground_truth[c - 2, 0] == -1):
                                         candidates.append(c - 3)
-                            elif (
-                                c >= 3
-                                and runtime_ctx.is_syncope_token[c - 2] == 1
-                                and (
-                                    ground_truth[c - 1, 0] == blank
-                                    or ground_truth[c - 1, 0] == -1
-                                )
-                            ):
-                                vowel_tok = ground_truth[c - 2, 0]
-                                if lpz[t + offsets[c], anchor_tok] > lpz[t + offsets[c], vowel_tok]:
-                                    candidates.append(c - 3)
-                                    if c >= 4 and (ground_truth[c - 3, 0] == blank or ground_truth[c - 3, 0] == -1):
-                                        candidates.append(c - 4)
 
                             for c_prev in candidates:
                                 delta_offset = offsets[c] - offsets[c_prev]
@@ -963,12 +970,28 @@ def determine_utterance_segments(
         :param align_type:  one of ["begin", "end"]
         :return: start/end time of utterance in seconds
         """
-        middle = (timings[index] + timings[index - 1]) / 2
+        # Resolve active non-zero timing predecessors/successors for syncope robustness
+        prev_idx = index - 1
+        while prev_idx > 0 and timings[prev_idx] == 0.0:
+            prev_idx -= 1
+        t_prev = timings[prev_idx] if prev_idx >= 0 else 0.0
+
+        next_idx = index
+        while next_idx < len(timings) - 1 and timings[next_idx] == 0.0:
+            next_idx += 1
+        t_next = timings[next_idx] if next_idx < len(timings) else (timings[index] if index < len(timings) else 0.0)
+
         if align_type == "begin":
-            return max(timings[index + 1] - 0.5, middle)
+            spoken_idx = index + 1
+            while spoken_idx < len(timings) - 1 and timings[spoken_idx] == 0.0:
+                spoken_idx += 1
+            t_spoken = timings[spoken_idx] if spoken_idx < len(timings) else timings[index]
+            middle = (t_next + t_prev) / 2 if (t_next > 0 and t_prev > 0) else (t_spoken if t_prev == 0 else (t_next + t_prev) / 2)
+            return max(t_spoken - 0.5, middle)
         elif align_type == "end":
-            return min(timings[index - 1] + 0.5, middle)
-        return middle
+            middle = (t_next + t_prev) / 2 if (t_next > 0 and t_prev > 0) else t_prev
+            return min(t_prev + 0.5, middle)
+        return (t_next + t_prev) / 2
 
     segments = []
     min_prob = np.float64(config.max_prob)

@@ -404,4 +404,141 @@ def test_relative_contrastive_syncope_gating_invariants():
     assert timings_b[4] > 0.0, f"Expected 't' to be aligned, got {timings_b[4]}"
 
 
+def test_inter_word_syncope_pronounced():
+    """Test 9: Inter-word syncope pronounced: vowel before word boundary is preserved."""
+    words = ["kanohetv", "tsisa"]
+    char_list = ["•"] + sorted(list(set("kanohetvtsisa")))
+    config = CtcSegmentationParameters(
+        char_list=char_list,
+        blank=0,
+        syncope_tokens=["v"],
+        min_window_size=100,
+        score_min_mean_over_L=2,
+    )
+    gt_mat, utt_indices = prepare_text(config, words, char_list)
+
+    # Audio contains full pronunciation: 'kanohetv' -> inter-word blank -> 'tsisa'
+    V = len(char_list)
+    frames_per_char = 3
+    blank_frames = 2
+    chars_w1 = list("kanohetv")
+    chars_w2 = list("tsisa")
+    total_frames = blank_frames + len(chars_w1) * frames_per_char + blank_frames + len(chars_w2) * frames_per_char + blank_frames
+    lpz = np.full((total_frames, V), -10.0, dtype=np.float32)
+
+    # Initial blank
+    lpz[0:blank_frames, 0] = 0.0
+    t = blank_frames
+    for ch in chars_w1:
+        lpz[t : t + frames_per_char, char_list.index(ch)] = 0.0
+        t += frames_per_char
+    # Inter-word blank
+    lpz[t : t + blank_frames, 0] = 0.0
+    t += blank_frames
+    for ch in chars_w2:
+        lpz[t : t + frames_per_char, char_list.index(ch)] = 0.0
+        t += frames_per_char
+    # Final blank
+    lpz[t : t + blank_frames, 0] = 0.0
+
+    timings, char_probs, states = ctc_segmentation(config, lpz, gt_mat)
+    segs = determine_utterance_segments(config, utt_indices, char_probs, timings, words)
+
+    # In explicit pronunciation, 'v' must not be skipped
+    v_pos = [i for i in range(len(gt_mat)) if config.is_syncope_token[i] == 1]
+    assert len(v_pos) > 0
+    assert any(timings[p] > 0.0 for p in v_pos), "Expected word-final 'v' to have positive timing when pronounced"
+    assert "v" in states
+    assert segs[0][2] > -0.5
+    assert segs[1][2] > -0.5
+
+
+def test_inter_word_syncope_dropped():
+    """Test 10: Inter-word syncope dropped: final vowel and boundary PAD skipped cleanly to C_next."""
+    words = ["kanohetv", "tsisa"]
+    char_list = ["•"] + sorted(list(set("kanohetvtsisa")))
+    config = CtcSegmentationParameters(
+        char_list=char_list,
+        blank=0,
+        syncope_tokens=["v"],
+        min_window_size=100,
+        score_min_mean_over_L=2,
+    )
+    gt_mat, utt_indices = prepare_text(config, words, char_list)
+
+    # Audio drops 'v': 'kanohet' -> 'tsisa' (direct transition to onset 'ts')
+    spoken_chars = list("kanohettsisa")
+    lpz = make_emissions(spoken_chars, char_list, frames_per_char=3, blank_frames=2)
+
+    timings, char_probs, states = ctc_segmentation(config, lpz, gt_mat)
+    segs = determine_utterance_segments(config, utt_indices, char_probs, timings, words)
+
+    # 'v' at end of kanohetv must receive 0.0s timing
+    v_pos = [i for i in range(len(gt_mat)) if config.is_syncope_token[i] == 1]
+    for p in v_pos:
+        assert timings[p] == 0.0, f"Expected dropped word-final 'v' at pos {p} to have 0.0s timing, got {timings[p]}"
+
+    # Surrounding consonants 't' and 't' (onset of tsisa) receive valid positive timings
+    assert timings[8] > 0.0, "Expected 't' before dropped 'v' to have positive timing"
+    assert timings[11] > 0.0, "Expected 't' onset of 'tsisa' to have positive timing"
+    assert segs[0][2] > -0.5
+    assert segs[1][2] > -0.5
+
+
+def test_phrase_terminal_vowel_pronounced():
+    """Test 11: Phrase-terminal vowel pronounced: vowel before trailing silence is preserved."""
+    word = "atalenihskv"
+    char_list = ["•"] + sorted(list(set(word)))
+    config = CtcSegmentationParameters(
+        char_list=char_list,
+        blank=0,
+        syncope_tokens=["v"],
+        min_window_size=60,
+        score_min_mean_over_L=2,
+    )
+    gt_mat, utt_indices = prepare_text(config, [word], char_list)
+
+    # Fully articulated with 6 trailing blank frames
+    spoken_chars = list(word)
+    lpz = make_emissions(spoken_chars, char_list, frames_per_char=3, blank_frames=6)
+
+    timings, char_probs, states = ctc_segmentation(config, lpz, gt_mat)
+    segs = determine_utterance_segments(config, utt_indices, char_probs, timings, [word])
+
+    # Terminal vowel 'v' is at the end of the word
+    v_pos = [i for i in range(len(gt_mat)) if config.is_syncope_token[i] == 1]
+    assert len(v_pos) > 0
+    assert timings[v_pos[0]] > 0.0, f"Expected terminal 'v' to have positive timing, got {timings[v_pos[0]]}"
+    assert "v" in states
+    assert segs[0][2] > -0.5
+
+
+def test_phrase_terminal_vowel_dropped():
+    """Test 12: Phrase-terminal vowel dropped: final vowel skipped into terminal silence."""
+    word = "atalenihskv"
+    char_list = ["•"] + sorted(list(set(word)))
+    config = CtcSegmentationParameters(
+        char_list=char_list,
+        blank=0,
+        syncope_tokens=["v"],
+        min_window_size=60,
+        score_min_mean_over_L=2,
+    )
+    gt_mat, utt_indices = prepare_text(config, [word], char_list)
+
+    # Final 'v' is dropped, followed by 6 trailing blank frames
+    spoken_chars = list("atalenihsk")
+    lpz = make_emissions(spoken_chars, char_list, frames_per_char=3, blank_frames=6)
+
+    timings, char_probs, states = ctc_segmentation(config, lpz, gt_mat)
+    segs = determine_utterance_segments(config, utt_indices, char_probs, timings, [word])
+
+    # Terminal vowel 'v' must have 0.0s timing
+    v_pos = [i for i in range(len(gt_mat)) if config.is_syncope_token[i] == 1]
+    assert len(v_pos) > 0
+    assert timings[v_pos[0]] == 0.0, f"Expected dropped terminal 'v' to have 0.0s timing, got {timings[v_pos[0]]}"
+    assert segs[0][2] > -0.5
+
+
+
 

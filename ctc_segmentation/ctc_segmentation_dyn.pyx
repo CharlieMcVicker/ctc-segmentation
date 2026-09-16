@@ -30,7 +30,8 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
     """Fill the table of transition probabilities.
 
     Supports blank-constrained syncope skip transitions (enforcing the Consonant
-    Preservation Invariant and Blank-Only Stride Invariants for Case A and Case B)
+    Preservation Invariant, Non-Acoustic Blank Rejection Invariant, and onset anchor
+    gating for inter-word syncope and phrase-terminal likelihood competition)
     and blank-tolerant intrusive token detours with unified Relative Contrastive
     Acoustic Gating (zero hyperparameter runtime).
 
@@ -40,7 +41,8 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
     :param offsets: window offsets per character (given as array of zeros)
     :param is_syncope_token: 1D mask array marking optional syncope token positions
         for blank-constrained syncope transitions (enforces the blank-only stride
-        invariant so non-syncope characters/consonants are preserved).
+        and non-acoustic blank rejection invariants so non-syncope characters/consonants
+        are preserved).
     :param intrusive_token_ids: 1D array of token IDs eligible for intrusive insertion
     :param is_intrusive_site: 1D mask array gating allowed intrusive detour transition sites
     :param intrusive_max_stride: maximum blank frame stride for intrusive transitions
@@ -114,21 +116,35 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                 for s in range(ground_truth.shape[1]):
                     if ground_truth[c, s] != -1:
                         anchor_tok = ground_truth[c, s]
-                        # Case A: c - 1 is a syncope token
-                        if is_syncope_token[c - 1] == 1:
-                            vowel_tok = ground_truth[c - 1, 0]
-                            # Gate: acoustics at arrival frame must favor anchor over skipped vowel
-                            if lpz[t + offset_sum, anchor_tok] > lpz[t + offset_sum, vowel_tok]:
-                                # 1. Direct 1-token skip over syncope vowel (c - 2 -> c)
-                                delta_offset = offset_sum - offsets[c - 2]
-                                t_prev = t - 1 + delta_offset
-                                if 0 <= t_prev < table.shape[0]:
-                                    v_prob = table[t_prev, c - 2] + lpz[t + offset_sum, anchor_tok]
-                                    if v_prob > syncope_skip_prob:
-                                        syncope_skip_prob = v_prob
+                        if anchor_tok != blank:
+                            # Case A: c - 1 is a syncope token
+                            if is_syncope_token[c - 1] == 1:
+                                vowel_tok = ground_truth[c - 1, 0]
+                                # Gate: acoustics at arrival frame must favor anchor over skipped vowel
+                                if lpz[t + offset_sum, anchor_tok] > lpz[t + offset_sum, vowel_tok]:
+                                    # 1. Direct 1-token skip over syncope vowel (c - 2 -> c)
+                                    delta_offset = offset_sum - offsets[c - 2]
+                                    t_prev = t - 1 + delta_offset
+                                    if 0 <= t_prev < table.shape[0]:
+                                        v_prob = table[t_prev, c - 2] + lpz[t + offset_sum, anchor_tok]
+                                        if v_prob > syncope_skip_prob:
+                                            syncope_skip_prob = v_prob
 
-                                # 2. 2-token skip (c - 3 -> c) ONLY IF c - 2 is a blank/PAD
-                                if c >= 3 and (ground_truth[c - 2, 0] == blank or ground_truth[c - 2, 0] == -1):
+                                    # 2. 2-token skip (c - 3 -> c) ONLY IF c - 2 is a blank/PAD
+                                    if c >= 3 and (ground_truth[c - 2, 0] == blank or ground_truth[c - 2, 0] == -1):
+                                        delta_offset = offset_sum - offsets[c - 3]
+                                        t_prev = t - 1 + delta_offset
+                                        if 0 <= t_prev < table.shape[0]:
+                                            v_prob = table[t_prev, c - 3] + lpz[t + offset_sum, anchor_tok]
+                                            if v_prob > syncope_skip_prob:
+                                                syncope_skip_prob = v_prob
+
+                            # Case B: c - 2 is syncope token and c - 1 is a blank/space (inter-word syncope)
+                            elif c >= 3 and is_syncope_token[c - 2] == 1 and (ground_truth[c - 1, 0] == blank or ground_truth[c - 1, 0] == -1):
+                                vowel_tok = ground_truth[c - 2, 0]
+                                # Gate: acoustics at arrival frame must favor anchor over skipped vowel
+                                if lpz[t + offset_sum, anchor_tok] > lpz[t + offset_sum, vowel_tok]:
+                                    # 1. Skip vowel + trailing blank (c - 3 -> c)
                                     delta_offset = offset_sum - offsets[c - 3]
                                     t_prev = t - 1 + delta_offset
                                     if 0 <= t_prev < table.shape[0]:
@@ -136,25 +152,32 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                                         if v_prob > syncope_skip_prob:
                                             syncope_skip_prob = v_prob
 
-                        # Case B: c - 2 is syncope token and c - 1 is a blank/space
-                        elif c >= 3 and is_syncope_token[c - 2] == 1 and (ground_truth[c - 1, 0] == blank or ground_truth[c - 1, 0] == -1):
-                            vowel_tok = ground_truth[c - 2, 0]
-                            # Gate: acoustics at arrival frame must favor anchor over skipped vowel
-                            if lpz[t + offset_sum, anchor_tok] > lpz[t + offset_sum, vowel_tok]:
-                                # 1. Skip vowel + trailing blank (c - 3 -> c)
-                                delta_offset = offset_sum - offsets[c - 3]
+                                    # 2. Skip leading blank + vowel + trailing blank (c - 4 -> c) ONLY IF c - 3 is blank
+                                    if c >= 4 and (ground_truth[c - 3, 0] == blank or ground_truth[c - 3, 0] == -1):
+                                        delta_offset = offset_sum - offsets[c - 4]
+                                        t_prev = t - 1 + delta_offset
+                                        if 0 <= t_prev < table.shape[0]:
+                                            v_prob = table[t_prev, c - 4] + lpz[t + offset_sum, anchor_tok]
+                                            if v_prob > syncope_skip_prob:
+                                                syncope_skip_prob = v_prob
+
+                        elif c == table.shape[1] - 1:
+                            # Phrase-terminal PAD likelihood competition
+                            if is_syncope_token[c - 1] == 1:
+                                # 1. Direct skip over terminal vowel into terminal PAD (c - 2 -> c)
+                                delta_offset = offset_sum - offsets[c - 2]
                                 t_prev = t - 1 + delta_offset
                                 if 0 <= t_prev < table.shape[0]:
-                                    v_prob = table[t_prev, c - 3] + lpz[t + offset_sum, anchor_tok]
+                                    v_prob = table[t_prev, c - 2] + lpz[t + offset_sum, anchor_tok]
                                     if v_prob > syncope_skip_prob:
                                         syncope_skip_prob = v_prob
 
-                                # 2. Skip leading blank + vowel + trailing blank (c - 4 -> c) ONLY IF c - 3 is blank
-                                if c >= 4 and (ground_truth[c - 3, 0] == blank or ground_truth[c - 3, 0] == -1):
-                                    delta_offset = offset_sum - offsets[c - 4]
+                                # 2. 2-token skip (c - 3 -> c) ONLY IF c - 2 is blank
+                                if c >= 3 and (ground_truth[c - 2, 0] == blank or ground_truth[c - 2, 0] == -1):
+                                    delta_offset = offset_sum - offsets[c - 3]
                                     t_prev = t - 1 + delta_offset
                                     if 0 <= t_prev < table.shape[0]:
-                                        v_prob = table[t_prev, c - 4] + lpz[t + offset_sum, anchor_tok]
+                                        v_prob = table[t_prev, c - 3] + lpz[t + offset_sum, anchor_tok]
                                         if v_prob > syncope_skip_prob:
                                             syncope_skip_prob = v_prob
 

@@ -227,6 +227,8 @@ To support syncope in $O(T \times S)$ polynomial time while strictly protecting 
 
 1. **Consonant Preservation Invariant**: A syncope transition **MUST NOT** omit any character token whose `is_syncope_token == 0`.
 2. **Blank-Only Stride Invariant**: Multi-column skips across optional syncope tokens are valid **if and only if** any additional intermediate columns are CTC blank / PAD tokens ($L = \text{blank}$ or $L = -1$).
+3. **Non-Acoustic Blank Rejection Invariant**: An intermediate inter-word `PAD` (blank token) must **never** serve as a contrastive gating anchor. Inter-word syncope skips across $(V_{\text{final}} + \text{PAD})$ are evaluated when column $c$ reaches the true acoustic onset anchor of the subsequent word ($C_{\text{next}}$).
+4. **Phrase-Terminal Direct Likelihood Competition**: At phrase/utterance-final boundaries ($c = \text{table.shape}[1] - 1$), transitions into terminal silence (`PAD_end`) are strictly anchored to the consonant offset boundary ($t_{\text{prev}} = t - 1$) without intermediate blank-farming, allowing pure likelihood competition between Path A ($C \to V \to \text{PAD}$) and Path B ($C \to \text{PAD}$).
 
 ##### Relative Contrastive Syncope Gate & Recurrence
 
@@ -236,7 +238,7 @@ $$\text{Gate}_{\text{syncope}}(t, c) = \begin{cases} \text{OPEN}, & \text{if } \
 
 When open, evaluate the transition with zero penalty ($\lambda_{\text{syncope}} = 0.0$):
 
-* **Case A: Immediate Syncope Vowel ($c - 1$ is syncope token, $c_{\text{vowel}} = c - 1$)**
+* **Case A: Immediate Syncope Vowel ($c - 1$ is syncope token, $c_{\text{vowel}} = c - 1$, anchor is non-blank $L(c, s) \ne \text{blank}$)**
   1. *Direct 1-token skip ($c - 2 \to c$):*
      $$P_{\text{sync}, 1}(t, c) = \text{table}[t - 1 + \text{offset}(c, c - 2), c - 2] + \text{lpz}[t + \text{offset\_sum}, L(c, s)]$$
   2. *Blank-mediated 2-token skip ($c - 3 \to c$):*
@@ -246,13 +248,22 @@ When open, evaluate the transition with zero penalty ($\lambda_{\text{syncope}} 
      -\infty & \text{otherwise}
      \end{cases}$$
 
-* **Case B: Space/Blank Following Syncope Vowel ($c - 2$ is syncope token and $c - 1$ is blank, $c_{\text{vowel}} = c - 2$)**
+* **Case B: Inter-Word Syncope Across Blank ($c - 2$ is syncope token, $c - 1$ is blank, anchor is onset consonant $C_{\text{next}} = L(c, s) \ne \text{blank}$)**
   1. *Skip vowel + trailing blank ($c - 3 \to c$):*
      $$P_{\text{sync}, 3}(t, c) = \text{table}[t - 1 + \text{offset}(c, c - 3), c - 3] + \text{lpz}[t + \text{offset\_sum}, L(c, s)]$$
   2. *Skip leading blank + vowel + trailing blank ($c - 4 \to c$):*
      Permitted **only if** $c \ge 4$ and state $c - 3$ is a CTC blank/PAD token ($L(c - 3, 0) \in \{\text{blank}, -1\}$):
      $$P_{\text{sync}, 4}(t, c) = \begin{cases}
      \text{table}[t - 1 + \text{offset}(c, c - 4), c - 4] + \text{lpz}[t + \text{offset\_sum}, L(c, s)] & \text{if } L(c - 3, 0) \in \{\text{blank}, -1\} \\
+     -\infty & \text{otherwise}
+     \end{cases}$$
+
+* **Case C: Phrase-Terminal Syncope ($c = \text{table.shape}[1] - 1$, $c - 1$ is syncope token, anchor is terminal PAD)**
+  1. *Direct terminal skip ($c - 2 \to c$):*
+     $$P_{\text{sync}, 5}(t, c) = \text{table}[t - 1 + \text{offset}(c, c - 2), c - 2] + \text{lpz}[t + \text{offset\_sum}, \text{blank}]$$
+  2. *Blank-mediated terminal skip ($c - 3 \to c$):*
+     $$P_{\text{sync}, 6}(t, c) = \begin{cases}
+     \text{table}[t - 1 + \text{offset}(c, c - 3), c - 3] + \text{lpz}[t + \text{offset\_sum}, \text{blank}] & \text{if } L(c - 2, 0) \in \{\text{blank}, -1\} \\
      -\infty & \text{otherwise}
      \end{cases}$$
 
