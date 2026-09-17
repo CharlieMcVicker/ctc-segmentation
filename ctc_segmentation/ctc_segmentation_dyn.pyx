@@ -22,6 +22,7 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                       np.ndarray[np.int64_t, ndim=2] ground_truth,
                       np.ndarray[np.int64_t, ndim=1] offsets,
                       np.ndarray[np.int8_t, ndim=1] is_syncope_token,
+                      np.ndarray[np.int64_t, ndim=1] syncope_token_gates,
                       np.ndarray[np.int64_t, ndim=1] intrusive_token_ids,
                       np.ndarray[np.int8_t, ndim=1] is_intrusive_site,
                       int intrusive_max_stride,
@@ -43,6 +44,8 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
         for blank-constrained syncope transitions (enforces the blank-only stride
         and non-acoustic blank rejection invariants so non-syncope characters/consonants
         are preserved).
+    :param syncope_token_gates: 1D mapping array of size vocab_size mapping token ID
+        to pooled gate token index (or identity for singletons/unmapped tokens).
     :param intrusive_token_ids: 1D array of token IDs eligible for intrusive insertion
     :param is_intrusive_site: 1D mask array gating allowed intrusive detour transition sites
     :param intrusive_max_stride: maximum blank frame stride for intrusive transitions
@@ -65,7 +68,7 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
     cdef float max_lpz_prob
     cdef float p, v_prob, p_cand, blank_sum, base_prob
     cdef int s, delta_offset, t_prev, j_idx, j, delta, b_t, t_detour, has_candidate, t_departure
-    cdef int anchor_tok, vowel_tok
+    cdef int anchor_tok, vowel_tok, gate_tok
     cdef int num_intrusive_tokens = intrusive_token_ids.shape[0]
     cdef int stay_transition_cost_zero
     cdef int preamble_transition_cost_zero
@@ -120,8 +123,9 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                             # Case A: c - 1 is a syncope token
                             if is_syncope_token[c - 1] == 1:
                                 vowel_tok = ground_truth[c - 1, 0]
-                                # Gate: acoustics at arrival frame must favor anchor over skipped vowel
-                                if lpz[t + offset_sum, anchor_tok] > lpz[t + offset_sum, vowel_tok]:
+                                gate_tok = syncope_token_gates[vowel_tok] if syncope_token_gates.shape[0] > vowel_tok else vowel_tok
+                                # Gate: acoustics at arrival frame must favor anchor over skipped vowel / vowel class
+                                if lpz[t + offset_sum, anchor_tok] > lpz[t + offset_sum, gate_tok]:
                                     # 1. Direct 1-token skip over syncope vowel (c - 2 -> c)
                                     delta_offset = offset_sum - offsets[c - 2]
                                     t_prev = t - 1 + delta_offset
@@ -142,8 +146,9 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                             # Case B: c - 2 is syncope token and c - 1 is a blank/space (inter-word syncope)
                             elif c >= 3 and is_syncope_token[c - 2] == 1 and (ground_truth[c - 1, 0] == blank or ground_truth[c - 1, 0] == -1):
                                 vowel_tok = ground_truth[c - 2, 0]
-                                # Gate: acoustics at arrival frame must favor anchor over skipped vowel
-                                if lpz[t + offset_sum, anchor_tok] > lpz[t + offset_sum, vowel_tok]:
+                                gate_tok = syncope_token_gates[vowel_tok] if syncope_token_gates.shape[0] > vowel_tok else vowel_tok
+                                # Gate: acoustics at arrival frame must favor anchor over skipped vowel / vowel class
+                                if lpz[t + offset_sum, anchor_tok] > lpz[t + offset_sum, gate_tok]:
                                     # 1. Skip vowel + trailing blank (c - 3 -> c)
                                     delta_offset = offset_sum - offsets[c - 3]
                                     t_prev = t - 1 + delta_offset
