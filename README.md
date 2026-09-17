@@ -140,16 +140,15 @@ To align text containing optional syncopated tokens (e.g. Cherokee medial vowel 
 import numpy as np
 import ctc_segmentation
 
-# Configure parameters with optional syncope tokens and penalty
+# Configure parameters with optional syncope tokens
 char_list = ["•", "a", "e", "i", "o", "u", "v", "ts", "l", "g"]
 config = ctc_segmentation.CtcSegmentationParameters(
     char_list=char_list,
     syncope_tokens=["a", "e", "i", "o", "u", "v"],  # tokens that can be skipped via syncope
-    syncope_penalty=0.25,                           # log-space skip penalty
 )
 
 # Prepare ground truth and run alignment
-# If 'a' in 'tsalagi' is omitted in speech ('tsalgi'), the trellis jumps the syncope token state
+# If 'a' in 'tsalagi' is omitted in speech ('tsalgi'), relative contrastive gating allows the skip when acoustics favor 'l' over 'a'
 text = ["tsalagi"]
 ground_truth_mat, utt_begin_indices = ctc_segmentation.prepare_text(config, text)
 timings, char_probs, state_list = ctc_segmentation.ctc_segmentation(config, probs, ground_truth_mat)
@@ -166,20 +165,16 @@ To align text when speakers insert unwritten surface sounds (e.g. pre-/post-aspi
 import numpy as np
 import ctc_segmentation
 
-# Configure parameters with candidate intrusive tokens, per-token penalties, and min-logprob gating
+# Configure parameters with candidate intrusive tokens and maximum blank frame stride
 char_list = ["•", "a", "k", "e", "y", "h", "'"]
 config = ctc_segmentation.CtcSegmentationParameters(
     char_list=char_list,
     intrusive_tokens=["h", "'"],  # intrusive tokens permitted between ground-truth states
-    # Per-token transition penalties (or a uniform float e.g. 0.1)
-    intrusive_penalties={"h": 0.15, "'": 0.3},
-    # Minimum log-probability threshold gating (suppresses diffuse noise like /h/ while retaining sharp peaks like /'/)
-    intrusive_min_logprobs={"h": -1.2, "'": -0.7},  # linear probabilities in (0, 1] e.g. 0.3 or log-probs e.g. -1.2
     intrusive_max_stride=4,       # maximum blank frame stride bridging intrusive tokens (default: 4)
 )
 
 # Prepare ground truth and run alignment
-# If citation 'akeya' is spoken as surface 'akeyha', the trellis takes a blank-tolerant detour through 'h'
+# If citation 'akeya' is spoken as surface 'akeyha', relative contrastive gating takes a detour through 'h'
 text = ["akeya"]
 ground_truth_mat, utt_begin_indices = ctc_segmentation.prepare_text(config, text)
 
@@ -188,7 +183,7 @@ ground_truth_mat, utt_begin_indices = ctc_segmentation.prepare_text(config, text
 config.is_intrusive_site = np.zeros(len(ground_truth_mat), dtype=np.int8)
 config.is_intrusive_site[3] = 1  # only permit detour transition leading into state index 3
 
-timings, char_probs, state_list = ctc_segmentation.ctc_segmentation(config, probs, ground_truth_mat)
+timings, char_probs, state_list = ctc_segmentation(config, probs, ground_truth_mat)
 segments = ctc_segmentation.determine_utterance_segments(config, utt_begin_indices, char_probs, timings, text)
 ```
 
@@ -224,7 +219,7 @@ To account for preambles or unrelated segments in audio files, the transition co
 
 ![Forward trellis](doc/1_forward.png)
 
-#### Syncope-Aware Trellis ($\epsilon$-Skip Transitions)
+#### Syncope-Aware Trellis ($\epsilon$-Skip Transitions with Relative Contrastive Gating)
 
 For languages with phonetic reductions or token syncope (e.g. Cherokee medial vowel syncope, unstressed sound deletion), sounds written in canonical text are often dropped in natural speech. Standard CTC segmentation forces alignment of every character, causing misalignments or requiring intractable $O(2^n)$ string expansions.
 
@@ -232,81 +227,76 @@ To support syncope in $O(T \times S)$ polynomial time while strictly protecting 
 
 1. **Consonant Preservation Invariant**: A syncope transition **MUST NOT** omit any character token whose `is_syncope_token == 0`.
 2. **Blank-Only Stride Invariant**: Multi-column skips across optional syncope tokens are valid **if and only if** any additional intermediate columns are CTC blank / PAD tokens ($L = \text{blank}$ or $L = -1$).
+3. **Non-Acoustic Blank Rejection Invariant**: An intermediate inter-word `PAD` (blank token) must **never** serve as a contrastive gating anchor. Inter-word syncope skips across $(V_{\text{final}} + \text{PAD})$ are evaluated when column $c$ reaches the true acoustic onset anchor of the subsequent word ($C_{\text{next}}$).
+4. **Phrase-Terminal Direct Likelihood Competition**: At phrase/utterance-final boundaries ($c = \text{table.shape}[1] - 1$), transitions into terminal silence (`PAD_end`) are strictly anchored to the consonant offset boundary ($t_{\text{prev}} = t - 1$) without intermediate blank-farming, allowing pure likelihood competition between Path A ($C \to V \to \text{PAD}$) and Path B ($C \to \text{PAD}$).
 
-##### Blank-Constrained Syncope Recurrence
+##### Relative Contrastive Syncope Gate & Recurrence
 
-Let $\text{is\_syncope\_token}[c] \in \{0, 1\}$ indicate if column $c$ is marked as an eligible syncope token, and $\lambda_{\text{syncope}} \ge 0$ be the configurable syncope penalty (`syncope_penalty`, default: `0.25`). For any arrival state $(t, c)$ with label $L(c, s) \ne -1$:
+Let $\text{is\_syncope\_token}[c] \in \{0, 1\}$ indicate if column $c$ is marked as an eligible syncope token. Rather than subtracting an arbitrary penalty, syncope skips are gated by local **Relative Contrastive Acoustic Evidence**: frame $t$ must exhibit stronger acoustic evidence for the incoming anchor token than for the skipped vowel:
 
-* **Case A: Immediate Syncope Vowel ($c - 1$ is syncope token)**
+$$\text{Gate}_{\text{syncope}}(t, c) = \begin{cases} \text{OPEN}, & \text{if } \text{lpz}[t + \text{offset\_sum}, L(c, s)] > \text{lpz}[t + \text{offset\_sum}, L(c_{\text{vowel}}, 0)] \\ \text{CLOSED}, & \text{otherwise} \end{cases}$$
+
+When open, evaluate the transition with zero penalty ($\lambda_{\text{syncope}} = 0.0$):
+
+* **Case A: Immediate Syncope Vowel ($c - 1$ is syncope token, $c_{\text{vowel}} = c - 1$, anchor is non-blank phoneme $L(c, s) \ne \text{blank}$)**
   1. *Direct 1-token skip ($c - 2 \to c$):*
-     $$P_{\text{sync}, 1}(t, c) = \text{table}[t - 1 + \text{offset}(c, c - 2), c - 2] + \text{lpz}[t + \text{offset\_sum}, L(c, s)] - \lambda_{\text{syncope}}$$
+     $$P_{\text{sync}, 1}(t, c) = \text{table}[t - 1 + \text{offset}(c, c - 2), c - 2] + \text{lpz}[t + \text{offset\_sum}, L(c, s)]$$
   2. *Blank-mediated 2-token skip ($c - 3 \to c$):*
      Permitted **only if** $c \ge 3$ and state $c - 2$ is a CTC blank/PAD token ($L(c - 2, 0) \in \{\text{blank}, -1\}$):
      $$P_{\text{sync}, 2}(t, c) = \begin{cases}
-     \text{table}[t - 1 + \text{offset}(c, c - 3), c - 3] + \text{lpz}[t + \text{offset\_sum}, L(c, s)] - \lambda_{\text{syncope}} & \text{if } L(c - 2, 0) \in \{\text{blank}, -1\} \\
+     \text{table}[t - 1 + \text{offset}(c, c - 3), c - 3] + \text{lpz}[t + \text{offset\_sum}, L(c, s)] & \text{if } L(c - 2, 0) \in \{\text{blank}, -1\} \\
      -\infty & \text{otherwise}
      \end{cases}$$
-     *(If $c - 2$ is a consonant or other non-syncope character, $c - 3 \to c$ is forbidden, enforcing consonant preservation.)*
 
-* **Case B: Space/Blank Following Syncope Vowel ($c - 2$ is syncope token and $c - 1$ is blank)**
+* **Case B: Inter-Word Syncope Across Blank ($c - 2$ is syncope token, $c - 1$ is blank, anchor is onset consonant $C_{\text{next}} = L(c, s) \ne \text{blank}$)**
   1. *Skip vowel + trailing blank ($c - 3 \to c$):*
-     $$P_{\text{sync}, 3}(t, c) = \text{table}[t - 1 + \text{offset}(c, c - 3), c - 3] + \text{lpz}[t + \text{offset\_sum}, L(c, s)] - \lambda_{\text{syncope}}$$
+     $$P_{\text{sync}, 3}(t, c) = \text{table}[t - 1 + \text{offset}(c, c - 3), c - 3] + \text{lpz}[t + \text{offset\_sum}, L(c, s)]$$
   2. *Skip leading blank + vowel + trailing blank ($c - 4 \to c$):*
      Permitted **only if** $c \ge 4$ and state $c - 3$ is a CTC blank/PAD token ($L(c - 3, 0) \in \{\text{blank}, -1\}$):
      $$P_{\text{sync}, 4}(t, c) = \begin{cases}
-     \text{table}[t - 1 + \text{offset}(c, c - 4), c - 4] + \text{lpz}[t + \text{offset\_sum}, L(c, s)] - \lambda_{\text{syncope}} & \text{if } L(c - 3, 0) \in \{\text{blank}, -1\} \\
+     \text{table}[t - 1 + \text{offset}(c, c - 4), c - 4] + \text{lpz}[t + \text{offset\_sum}, L(c, s)] & \text{if } L(c - 3, 0) \in \{\text{blank}, -1\} \\
      -\infty & \text{otherwise}
      \end{cases}$$
-     *(If $c - 3$ is a consonant or other non-syncope character, $c - 4 \to c$ is forbidden, preserving the preceding consonant.)*
 
-#### Intrusive Token Transitions (Blank-Tolerant Detours)
+#### Intrusive Token Transitions (Relative Contrastive Detours)
 
-In many languages and dialects, speakers pronounce intrusive sounds (e.g. pre-/post-aspiration `/h/`, glottal stop `/'/`, or epenthetic consonants) that are absent from canonical citation transcripts. Standard CTC segmentation trellises only permit transitions among characters present in the transcript, forcing acoustic evidence for intrusive phonemes into adjacent consonants or blanks.
+In many languages and dialects, speakers pronounce intrusive sounds (e.g. pre-/post-aspiration `/h/`, glottal stop `/'/`, or epenthetic consonants) that are absent from canonical citation transcripts.
 
-##### The CTC Blank Gap Problem & Blank-Tolerant Recurrence
+##### The CTC Blank Gap Problem & Unified Relative Contrastive Gating
 
-CTC acoustic models emit discrete posterior peaks separated by blank (`[PAD]` / $\epsilon$) frames. An intrusive acoustic event (e.g. aspiration `/h/`) is often separated from the subsequent ground-truth state by several blank frames:
+CTC acoustic models emit discrete posterior peaks separated by blank (`[PAD]` / $\epsilon$) frames:
 ```text
 Frame t - 1 - δ:        'h'   (intrusive token peak)
 Frames t - δ .. t - 1:  [PAD] (intervening CTC blank frames)
 Frame t:                'u'   (ground truth token state c)
 ```
 
-To support intrusive transitions across CTC blank gaps in $O(T \times S \times |J_{\text{intrusive}}| \times W)$ time:
-* **Blank-Tolerant Intrusive Detour**: Between ground-truth character states $c-1$ and $c$, the dynamic programming trellis evaluates intrusive token $j \in J$ across blank frame strides $\delta \in [0, W]$:
-  $$P_{\text{intrusive}}(t, c) = \begin{cases}
-  \max_{j \in J, 0 \le \delta \le W} \left[ \begin{aligned}
-  &\text{table}[t - 2 - \delta + \text{offset}, c - 1] \\
-  &+ \text{lpz}[t - 1 - \delta + \text{offset\_sum}, j] - \lambda_j \\
-  &+ \sum_{b=t-\delta}^{t-1} \text{lpz}[b + \text{offset\_sum}, \text{blank}] \\
-  &+ \text{lpz}[t + \text{offset\_sum}, L(c)]
-  \end{aligned} \right] & \text{if } M_{\text{site}}[c] = 1 \text{ and } \text{lpz}[t - 1 - \delta + \text{offset\_sum}, j] \ge \tau_j \\
-  -\infty & \text{otherwise}
-  \end{cases}$$
-  where $W \ge 0$ is the maximum blank stride (`intrusive_max_stride`, default: `4`), $\lambda_j \ge 0$ is the per-token transition penalty (`intrusive_penalties` / `intrusive_penalty`), $\tau_j$ is the per-token minimum log-probability threshold (`intrusive_min_logprobs`), $M_{\text{site}}[c] \in \{0, 1\}$ is the site mask (`is_intrusive_site`), and $\text{blank}$ is the CTC blank index.
+Instead of requiring fixed log-probability thresholds or hand-tuned penalties, candidate intrusive tokens $j \in J$ at frame $t_{\text{detour}} = t - 1 - \delta + \text{offset\_sum}$ are evaluated by **Relative Contrastive Acoustic Evidence**: acoustics must favor the intrusive candidate over the expected target anchor token $L(c, s)$:
+
+$$\text{Gate}_{\text{intrusive}}(t_{\text{detour}}, c, j) = \begin{cases} \text{OPEN}, & \text{if } \text{lpz}[t_{\text{detour}}, j] > \text{lpz}[t_{\text{detour}}, L(c, s)] \\ \text{CLOSED}, & \text{otherwise} \end{cases}$$
+
+When open, evaluate the path with zero penalty:
+$$P_{\text{intrusive}}(t, c) = \begin{cases}
+\max_{j \in J, 0 \le \delta \le W} \left[ \begin{aligned}
+&\text{table}[t - 2 - \delta + \text{offset}, c - 1 - s] \\
+&+ \text{lpz}[t_{\text{detour}}, j] \\
+&+ \sum_{b=t-\delta}^{t-1} \text{lpz}[b + \text{offset\_sum}, \text{blank}] \\
+&+ \text{lpz}[t + \text{offset\_sum}, L(c, s)]
+\end{aligned} \right] & \text{if } M_{\text{site}}[c] = 1 \text{ and } \text{Gate}_{\text{intrusive}} \text{ is OPEN} \\
+-\infty & \text{otherwise}
+\end{cases}$$
+
+where $W \ge 0$ is the maximum blank stride (`intrusive_max_stride`, default: `4`), $M_{\text{site}}[c] \in \{0, 1\}$ is the site mask (`is_intrusive_site`), and $\text{blank}$ is the CTC blank index.
+
 * **Single-Slot Mutual Exclusivity**: Between any two ground-truth states, at most one intrusion is permitted, preventing ungrammatical stacking while cleanly reconstructing surface phonetic realisations.
-
-##### Minimum Log-Probability Threshold Gating ($\tau_j$)
-
-* **Rationale**: CTC acoustic models frequently output low-level diffuse posterior probabilities across unvoiced regions or blank frames for continuous fricative or aspirate sounds (such as `/h/`). Without threshold gating, these diffuse tails can accumulate enough joint probability to trigger spurious detours. In contrast, transient acoustic events such as glottal stops `/'/` or stop bursts manifest as sharp, high-confidence posterior spikes.
-* **Gating Formulation**: Setting `intrusive_min_logprobs` establishes a hard posterior floor $\tau_j$:
-  $$\text{lpz}[t_{\text{detour}}, j] \ge \tau_j$$
-  Detour candidates failing this threshold are pruned ($-\infty$), effectively filtering diffuse background noise while permitting high-confidence transient events without requiring overly punitive transition penalties.
-
-##### Per-Token Transition Penalties ($\lambda_j$)
-
-Different phonemes exhibit varying prior insertion likelihoods. The `intrusive_penalties` parameter allows configuring individual transition penalties $\lambda_j$ per token (e.g. `{"h": 0.1, "'": 0.3}`) or setting a uniform float penalty.
-
-##### Phonotactic Site Masking ($M_{\text{site}}$)
-
-Phonological rules dictate that intrusive sounds occur only in specific environments (e.g. post-vocalic aspiration or intervocalic glottal stops). Passing `is_intrusive_site` as a 1D `int8` mask array matching `len(ground_truth)` restricts detour transitions to phonotactically licensed positions ($M_{\text{site}}[c] = 1$), eliminating search space overhead and preventing illicit insertions.
+* **Phonotactic Site Masking ($M_{\text{site}}$)**: Passing `is_intrusive_site` as a 1D `int8` mask array matching `len(ground_truth)` restricts detour transitions to phonotactically licensed positions ($M_{\text{site}}[c] = 1$).
 
 ##### Architecture: Userspace Config & TrellisRuntimeContext
 
-To achieve both high usability and maximum C-level execution performance, CTC segmentation employs an architectural separation:
-1. **Userspace Configuration (`CtcSegmentationParameters`)**: Accepts flexible Python structures, including string token lists, dictionary-based penalty and threshold mappings, and linear probability thresholds in $(0, 1]$.
-2. **Compiled Runtime Arrays (`TrellisRuntimeContext`)**: Prior to trellis execution, `TrellisRuntimeContext.compile(config, ground_truth)` validates parameters, converts linear probabilities to log-space, maps token strings to integer indices, and outputs contiguous 1D NumPy arrays (`int64`, `int8`, `float32`).
-3. **Zero-Overhead DP Core**: The Cython engine (`cython_fill_table`) and backtracking operate exclusively on these C-contiguous arrays, eliminating Python GIL contention and dictionary lookups during inner trellis loops.
+CTC segmentation employs a clean architectural separation:
+1. **Userspace Configuration (`CtcSegmentationParameters`)**: Accepts Python structures (token lists, masks, stride constraints).
+2. **Compiled Runtime Arrays (`TrellisRuntimeContext`)**: Compiles configuration into C-contiguous 1D NumPy arrays (`int64`, `int8`, `int`).
+3. **Zero-Overhead DP Core**: The Cython engine (`cython_fill_table`) and backtracking operate in log space with zero `exp()` calls and zero penalties.
 
 ### 2. Backtracking
 
@@ -349,16 +339,12 @@ There are several notable parameters to adjust the working of the algorithm that
 
 ### Syncope & optional token parameters
 
-* `syncope_tokens` (default: `None`): List of character strings or token IDs (e.g. `["a", "e", "i", "o", "u", "v"]`) that can be optionally skipped in speech. When set, `prepare_text`, `prepare_token_list`, and `prepare_tokenized_text` automatically build the `is_syncope_token` mask. (Legacy alias: `optional_vowel_tokens`).
-* `syncope_penalty` (default: `0.25`): Penalty in log space ($\lambda_{\text{syncope}}$) applied when taking a syncope-skip transition. Prevents over-eager skipping when acoustic evidence for the token exists. (Legacy alias: `syncopy_penalty`).
+* `syncope_tokens` (default: `None`): List of character strings or token IDs (e.g. `["a", "e", "i", "o", "u", "v"]`) that can be optionally skipped in speech via relative contrastive acoustic gating. When set, `prepare_text`, `prepare_token_list`, and `prepare_tokenized_text` automatically build the `is_syncope_token` mask. (Legacy alias: `optional_vowel_tokens`).
 * `is_syncope_token` (default: `None`): 1D `int8` mask array across the interleaved state sequence marking optional syncope token positions. Can be explicitly passed or generated automatically. (Legacy alias: `is_optional_vowel`).
 
 ### Intrusive token parameters
 
-* `intrusive_tokens` (default: `None`): Sequence of character strings or token IDs (e.g. `["h", "'"]`) eligible for intrusive detour insertion between ground-truth states when supported by acoustic evidence.
-* `intrusive_penalty` (default: `0.1`): Default log-space penalty ($\lambda_{\text{intrusive}}$) subtracted from intrusive detour transitions.
-* `intrusive_penalties` (default: `None`): Uniform float penalty or per-token dictionary (e.g. `{"h": 0.1, "'": 0.3}`) mapping token strings or integer IDs to individual transition penalties.
-* `intrusive_min_logprobs` (default: `None`): Uniform float or per-token dictionary (e.g. `{"h": -1.2, "'": -0.7}`) specifying minimum log-probability thresholds (or linear probabilities in $(0, 1]$) gating intrusive candidate evaluation.
+* `intrusive_tokens` (default: `None`): Sequence of character strings or token IDs (e.g. `["h", "'"]`) eligible for intrusive detour insertion between ground-truth states when favored by relative contrastive acoustic gating.
 * `intrusive_max_stride` (default: `4`): Maximum number of intervening CTC blank frames permitted between the intrusive token and the next ground-truth token.
 * `is_intrusive_site` (default: `None`): 1D `int8` mask array of size `len(ground_truth)` restricting intrusive detours strictly to licensed positions.
 * `is_intrusive_token` (default: `None`): 1D `int8` mask array of size `len(char_list)` marking eligible intrusive tokens in the vocabulary.

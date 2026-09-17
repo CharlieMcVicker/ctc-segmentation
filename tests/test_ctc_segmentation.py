@@ -475,10 +475,7 @@ def test_syncope_mask():
     config = CtcSegmentationParameters(
         char_list=char_list,
         syncope_tokens=["a", "o"],
-        syncope_penalty=0.3,
     )
-    # Test deprecated alias
-    assert config.syncopy_penalty == 0.3
 
     # Test prepare_text
     text = ["cat", "dog"]
@@ -516,7 +513,6 @@ def test_syncope_trellis_with_token_skip():
     config = CtcSegmentationParameters(
         char_list=char_list,
         syncope_tokens=["v1"],
-        syncope_penalty=0.25,
         min_window_size=30,
         score_min_mean_over_L=2,
     )
@@ -570,7 +566,6 @@ def test_syncope_trellis_text_preparation():
     config = CtcSegmentationParameters(
         char_list=char_list,
         syncope_tokens=["a"],
-        syncope_penalty=0.3,
         min_window_size=30,
         score_min_mean_over_L=2,
     )
@@ -607,7 +602,6 @@ def test_intrusive_token_parameters():
     # Default values
     config = CtcSegmentationParameters()
     assert config.intrusive_tokens is None
-    assert config.intrusive_penalty == 0.1
     assert config.intrusive_max_stride == 4
     assert config.is_intrusive_token is None
 
@@ -616,22 +610,18 @@ def test_intrusive_token_parameters():
     config2 = CtcSegmentationParameters(
         char_list=char_list,
         intrusive_tokens=["h", "'"],
-        intrusive_penalty=0.6,
         intrusive_max_stride=6,
     )
     assert config2.intrusive_tokens == ["h", "'"]
-    assert config2.intrusive_penalty == 0.6
     assert config2.intrusive_max_stride == 6
 
     # set() method
     config.set(
         char_list=char_list,
         intrusive_tokens=["h"],
-        intrusive_penalty=0.4,
         intrusive_max_stride=2,
     )
     assert config.intrusive_tokens == ["h"]
-    assert config.intrusive_penalty == 0.4
     assert config.intrusive_max_stride == 2
 
     # intrusive_max_stride validation
