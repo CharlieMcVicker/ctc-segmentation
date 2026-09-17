@@ -798,6 +798,16 @@ def ctc_segmentation(
                                 delta_offset = offsets[c] - offsets[c_prev]
                                 t_prev = t - 1 + delta_offset
                                 if 0 <= t_prev < table.shape[0]:
+                                    tau_start = (t_prev + 1 - delta_offset) + offsets[c]
+                                    tau_end = t + offsets[c]
+                                    if np.any(lpz_extended[tau_start:tau_end, gate_tok] > lpz_extended[tau_start:tau_end, blank]):
+                                        continue
+                                    prev_tok = ground_truth[c_prev, 0]
+                                    t_departure = t_prev - delta_offset + offsets[c]
+                                    if 0 <= t_departure < lpz_extended.shape[0]:
+                                        if lpz_extended[t_departure, gate_tok] > lpz_extended[t_departure, blank]:
+                                            if prev_tok != blank and prev_tok >= 0 and lpz_extended[t_departure, gate_tok] > lpz_extended[t_departure, prev_tok]:
+                                                continue
                                     est_v_prob = table[t, c] - table[t_prev, c_prev]
                                     expected_v_prob = lpz[t + offsets[c], anchor_tok]
                                     v_delta = abs(est_v_prob - expected_v_prob)

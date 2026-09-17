@@ -671,6 +671,77 @@ def test_syncope_token_classes_token_ids():
     assert "o" not in states
 
 
+def test_syncope_interval_peak_scanning_reproduction():
+    """Test 17: Reproduction case for ale (spoken ala) with inter-word syncope across blank."""
+    vocab = {"[PAD]": 0, "a": 1, "e": 2, "i": 3, "o": 4, "u": 5, "v": 6, "t": 7,
+             "l": 8, "n": 9, "k": 10, "s": 11, "h": 12, "'": 13, "|": 14}
+    inv_vocab = {v: k for k, v in vocab.items()}
+    char_list = [inv_vocab[i] for i in range(len(vocab))]
+
+    # Synthetic audio: 'a' (1-2), 'l' (3-4), 'a' (5-6) [spoken ala], 'n' (8-9), 'i' (10-11), 'k' (12-13), 'a' (14-15), 't' (16-17), 'v' (18-19)
+    T = 21
+    lpz = np.full((T, len(vocab)), -20.0, dtype=np.float32)
+    lpz[0, 0] = 0.0
+    lpz[1:3, vocab["a"]] = 0.0
+    lpz[3:5, vocab["l"]] = 0.0
+    lpz[5:7, vocab["a"]] = 0.0  # Spoken vowel is 'a', target is 'e'
+    lpz[7, 0] = 0.0
+    lpz[8:10, vocab["n"]] = 0.0
+    lpz[10:12, vocab["i"]] = 0.0
+    lpz[12:14, vocab["k"]] = 0.0
+    lpz[14:16, vocab["a"]] = 0.0
+    lpz[16:18, vocab["t"]] = 0.0
+    lpz[18:20, vocab["v"]] = 0.0
+    lpz[20, 0] = 0.0
+
+    params = CtcSegmentationParameters(
+        char_list=char_list,
+        blank=0,
+        syncope_tokens=[["a", "e", "i", "o", "u", "v"], "t"],
+        replace_spaces_with_blanks=False,
+    )
+    gt_mat, utt_indices = prepare_text(params, ["ale", "nikatv"], char_list)
+    timings, char_probs, state_list = ctc_segmentation(params, lpz, gt_mat)
+
+    # State list must retain canonical 'e' rather than dropping it
+    assert "e" in state_list, f"Vowel was erroneously dropped! state_list: {state_list}"
+
+
+def test_syncope_interval_peak_scanning_nahski():
+    """Test 18: Intra-word syncope candidate nahski (spoken nvhski) retains 'a' due to intermediate 'v' peak."""
+    vocab = {"[PAD]": 0, "n": 1, "a": 2, "e": 3, "i": 4, "o": 5, "u": 6, "v": 7, "h": 8, "s": 9, "k": 10}
+    inv_vocab = {v: k for k, v in vocab.items()}
+    char_list = [inv_vocab[i] for i in range(len(vocab))]
+
+    # Spoken 'nvhski' (vowel substitution 'v' for citation 'a')
+    # frames: PAD(0), n(1..3), v(4..6), h(7..9), s(10..12), k(13..15), i(16..18), PAD(19)
+    T = 20
+    lpz = np.full((T, len(vocab)), -20.0, dtype=np.float32)
+    lpz[0, 0] = 0.0
+    lpz[1:4, vocab["n"]] = 0.0
+    lpz[4:7, vocab["v"]] = 0.0  # Spoken vowel is 'v', target is 'a'
+    lpz[7:10, vocab["h"]] = 0.0
+    lpz[10:13, vocab["s"]] = 0.0
+    lpz[13:16, vocab["k"]] = 0.0
+    lpz[16:19, vocab["i"]] = 0.0
+    lpz[19, 0] = 0.0
+
+    params = CtcSegmentationParameters(
+        char_list=char_list,
+        blank=0,
+        syncope_tokens=[["a", "e", "i", "o", "u", "v"]],
+        replace_spaces_with_blanks=False,
+        min_window_size=60,
+        score_min_mean_over_L=2,
+    )
+    gt_mat, utt_indices = prepare_text(params, ["nahski"], char_list)
+    timings, char_probs, state_list = ctc_segmentation(params, lpz, gt_mat)
+
+    # State list must retain canonical 'a'
+    assert "a" in state_list, f"Vowel 'a' was erroneously dropped! state_list: {state_list}"
+
+
+
 
 
 
