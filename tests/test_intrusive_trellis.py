@@ -544,6 +544,7 @@ def test_cython_fill_table_relative_contrast_gating():
 
     offsets = np.zeros(2, dtype=np.int64)
     is_syncope_token = np.zeros(2, dtype=np.int8)
+    syncope_token_gates = np.arange(3, dtype=np.int64)
     intrusive_token_ids = np.array([2], dtype=np.int64)
     is_intrusive_site = np.zeros(0, dtype=np.int8)
 
@@ -554,6 +555,7 @@ def test_cython_fill_table_relative_contrast_gating():
         ground_truth,
         offsets,
         is_syncope_token,
+        syncope_token_gates,
         intrusive_token_ids,
         is_intrusive_site,
         4,
@@ -575,6 +577,7 @@ def test_cython_fill_table_site_masking():
 
     offsets = np.zeros(3, dtype=np.int64)
     is_syncope_token = np.zeros(3, dtype=np.int8)
+    syncope_token_gates = np.arange(4, dtype=np.int64)
     intrusive_token_ids = np.array([3], dtype=np.int64)
 
     site_mask_blocked = np.array([0, 0, 1], dtype=np.int8)
@@ -585,6 +588,7 @@ def test_cython_fill_table_site_masking():
         ground_truth,
         offsets,
         is_syncope_token,
+        syncope_token_gates,
         intrusive_token_ids,
         site_mask_blocked,
         4,
@@ -600,6 +604,7 @@ def test_cython_fill_table_site_masking():
         ground_truth,
         offsets,
         is_syncope_token,
+        syncope_token_gates,
         intrusive_token_ids,
         site_mask_allowed,
         4,

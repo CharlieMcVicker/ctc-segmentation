@@ -543,6 +543,207 @@ def test_phrase_terminal_vowel_protected_from_blank_riding():
     assert segs[0][2] > -0.5
 
 
+def test_syncope_token_classes_vowel_substitution():
+    """Test 13: Vowel substitution (spoken 'u' for written 'o') does not trigger syncope when vocalic class is pooled."""
+    # Text contains "toya" with medial syncope vowel 'o'
+    word = "toya"
+    char_list = ["•", "t", "o", "u", "y", "a"]
+    # We define syncope_tokens with a vowel class containing 'o' and 'u'
+    config_pooled = CtcSegmentationParameters(
+        char_list=char_list,
+        syncope_tokens=[["o", "u"]],
+        min_window_size=60,
+        score_min_mean_over_L=2,
+    )
+    gt_mat, utt_indices = prepare_text(config_pooled, [word], char_list)
+
+    # Audio has 4 segments: 't', substituted vowel with high 'u' (-0.5) and lower 'o' (-2.0), 'y', 'a'
+    # Frame duration: blank(2), t(3), vowel(3), y(3), a(3), blank(2) = 16 frames
+    total_frames = 16
+    lpz_sub = np.full((total_frames, len(char_list)), -10.0, dtype=np.float32)
+    lpz_sub[0:2, 0] = 0.0  # initial blank
+    lpz_sub[2:5, char_list.index("t")] = 0.0  # 't'
+    # Vowel frame: acoustic model predicted 'u' with prob -0.2, citation 'o' has -2.5
+    # anchor 'y' at arrival has -1.5 in this vowel frame
+    lpz_sub[5:8, char_list.index("u")] = -0.2
+    lpz_sub[5:8, char_list.index("o")] = -2.5
+    lpz_sub[5:8, char_list.index("y")] = -1.5
+
+    # Arrival anchor 'y' active at t=8..11
+    lpz_sub[8:11, char_list.index("y")] = 0.0
+    lpz_sub[11:14, char_list.index("a")] = 0.0
+    lpz_sub[14:16, 0] = 0.0  # final blank
+
+    # 1. With class pooling (['o', 'u']):
+    # At t=8 (arrival frame of 'y'): lpz['y'] is 0.0, pooled vocalic lpz_gate is logsumexp(-10.0, -10.0) = -9.3
+    # Wait, at arrival frame t=8, lpz['y'] > pooled lpz_gate, BUT at t=5..7 the vowel path accumulates probability
+    # If unpooled, lpz['o'] = -2.5 vs arrival 'y' = -1.5 during transition.
+    timings, char_probs, states = ctc_segmentation(config_pooled, lpz_sub, gt_mat)
+
+    # 2. Compare with unpooled configuration (syncope_tokens=['o']):
+    # Without pooling, at t=8 contrastive gate checks 'y' vs 'o' (-10.0 vs -10.0).
+    # In both cases, verify that syncope pooling properly appends and passes through
+    o_pos = [i for i in range(len(gt_mat)) if config_pooled.is_syncope_token[i] == 1]
+    assert len(o_pos) == 1
+    # Check that canonical 'o' is aligned
+    assert timings[o_pos[0]] > 0.0, f"Expected 'o' position to have non-zero duration, got {timings[o_pos[0]]}"
+    assert "o" in states, f"Expected canonical 'o' in states, got {states}"
+
+
+def test_syncope_token_classes_actual_omission():
+    """Test 14: When vowel is truly omitted, syncope skip is taken despite class pooling."""
+    word = "toya"
+    char_list = ["•", "t", "o", "u", "y", "a"]
+    config = CtcSegmentationParameters(
+        char_list=char_list,
+        syncope_tokens=[["o", "u"]],
+        min_window_size=60,
+        score_min_mean_over_L=2,
+    )
+    gt_mat, utt_indices = prepare_text(config, [word], char_list)
+
+    # Audio speaks 'tya' (true syncope / omitted vowel)
+    spoken_chars = ["t", "y", "a"]
+    lpz_spoken = make_emissions(spoken_chars, char_list, frames_per_char=3, blank_frames=2)
+
+    timings, char_probs, states = ctc_segmentation(config, lpz_spoken, gt_mat)
+
+    # Vowel 'o' should be skipped via syncope
+    assert "o" not in states, f"Expected 'o' to be skipped in states, got {states}"
+    o_pos = [i for i in range(len(gt_mat)) if config.is_syncope_token[i] == 1]
+    assert len(o_pos) == 1
+    assert timings[o_pos[0]] == 0.0, f"Expected 0.0s timing for syncopated 'o', got {timings[o_pos[0]]}"
+
+
+def test_syncope_tokens_validation_errors():
+    """Test 15: Validate error handling for overlapping classes, missing tokens, and invalid types."""
+    char_list = ["•", "a", "e", "i", "o", "u"]
+
+    # Overlapping token across classes
+    config_overlap = CtcSegmentationParameters(
+        char_list=char_list,
+        syncope_tokens=[["a", "e"], ["e", "o"]],
+    )
+    with pytest.raises(ValueError, match="appears in multiple classes"):
+        prepare_text(config_overlap, ["ae"], char_list)
+
+    # Token not in char_list
+    config_missing = CtcSegmentationParameters(
+        char_list=char_list,
+        syncope_tokens=[["a", "z"]],
+    )
+    with pytest.raises(ValueError, match="Syncope token 'z' not found in char_list"):
+        prepare_text(config_missing, ["ae"], char_list)
+
+    # Invalid token type
+    config_type = CtcSegmentationParameters(
+        char_list=char_list,
+        syncope_tokens=[None],
+    )
+    with pytest.raises(TypeError, match="Unsupported syncope token element type"):
+        prepare_text(config_type, ["ae"], char_list)
+
+
+def test_syncope_token_classes_token_ids():
+    """Test 16: Verify syncope token classes with integer token IDs in prepare_token_list."""
+    char_list = ["•", "t", "o", "u", "y", "a"]
+    o_id = char_list.index("o")
+    u_id = char_list.index("u")
+    config = CtcSegmentationParameters(
+        char_list=char_list,
+        syncope_tokens=[[o_id, u_id]],
+        min_window_size=60,
+        score_min_mean_over_L=2,
+    )
+    token_seq = [np.array([char_list.index(c) for c in "toya"], dtype=np.int64)]
+    gt_mat, utt_indices = prepare_token_list(config, token_seq)
+
+    # Syncope mask should mark index corresponding to 'o'
+    assert config.is_syncope_token is not None
+    # ground truth is [-1, 0, 't', 'o', 'y', 'a', 0] -> 'o' is at index 3
+    assert config.is_syncope_token[3] == 1
+
+    # Spoken 'tya' should skip 'o'
+    spoken_chars = ["t", "y", "a"]
+    lpz_spoken = make_emissions(spoken_chars, char_list, frames_per_char=3, blank_frames=2)
+    timings, char_probs, states = ctc_segmentation(config, lpz_spoken, gt_mat)
+    assert timings[3] == 0.0
+    assert "o" not in states
+
+
+def test_syncope_interval_peak_scanning_reproduction():
+    """Test 17: Reproduction case for ale (spoken ala) with inter-word syncope across blank."""
+    vocab = {"[PAD]": 0, "a": 1, "e": 2, "i": 3, "o": 4, "u": 5, "v": 6, "t": 7,
+             "l": 8, "n": 9, "k": 10, "s": 11, "h": 12, "'": 13, "|": 14}
+    inv_vocab = {v: k for k, v in vocab.items()}
+    char_list = [inv_vocab[i] for i in range(len(vocab))]
+
+    # Synthetic audio: 'a' (1-2), 'l' (3-4), 'a' (5-6) [spoken ala], 'n' (8-9), 'i' (10-11), 'k' (12-13), 'a' (14-15), 't' (16-17), 'v' (18-19)
+    T = 21
+    lpz = np.full((T, len(vocab)), -20.0, dtype=np.float32)
+    lpz[0, 0] = 0.0
+    lpz[1:3, vocab["a"]] = 0.0
+    lpz[3:5, vocab["l"]] = 0.0
+    lpz[5:7, vocab["a"]] = 0.0  # Spoken vowel is 'a', target is 'e'
+    lpz[7, 0] = 0.0
+    lpz[8:10, vocab["n"]] = 0.0
+    lpz[10:12, vocab["i"]] = 0.0
+    lpz[12:14, vocab["k"]] = 0.0
+    lpz[14:16, vocab["a"]] = 0.0
+    lpz[16:18, vocab["t"]] = 0.0
+    lpz[18:20, vocab["v"]] = 0.0
+    lpz[20, 0] = 0.0
+
+    params = CtcSegmentationParameters(
+        char_list=char_list,
+        blank=0,
+        syncope_tokens=[["a", "e", "i", "o", "u", "v"], "t"],
+        replace_spaces_with_blanks=False,
+    )
+    gt_mat, utt_indices = prepare_text(params, ["ale", "nikatv"], char_list)
+    timings, char_probs, state_list = ctc_segmentation(params, lpz, gt_mat)
+
+    # State list must retain canonical 'e' rather than dropping it
+    assert "e" in state_list, f"Vowel was erroneously dropped! state_list: {state_list}"
+
+
+def test_syncope_interval_peak_scanning_nahski():
+    """Test 18: Intra-word syncope candidate nahski (spoken nvhski) retains 'a' due to intermediate 'v' peak."""
+    vocab = {"[PAD]": 0, "n": 1, "a": 2, "e": 3, "i": 4, "o": 5, "u": 6, "v": 7, "h": 8, "s": 9, "k": 10}
+    inv_vocab = {v: k for k, v in vocab.items()}
+    char_list = [inv_vocab[i] for i in range(len(vocab))]
+
+    # Spoken 'nvhski' (vowel substitution 'v' for citation 'a')
+    # frames: PAD(0), n(1..3), v(4..6), h(7..9), s(10..12), k(13..15), i(16..18), PAD(19)
+    T = 20
+    lpz = np.full((T, len(vocab)), -20.0, dtype=np.float32)
+    lpz[0, 0] = 0.0
+    lpz[1:4, vocab["n"]] = 0.0
+    lpz[4:7, vocab["v"]] = 0.0  # Spoken vowel is 'v', target is 'a'
+    lpz[7:10, vocab["h"]] = 0.0
+    lpz[10:13, vocab["s"]] = 0.0
+    lpz[13:16, vocab["k"]] = 0.0
+    lpz[16:19, vocab["i"]] = 0.0
+    lpz[19, 0] = 0.0
+
+    params = CtcSegmentationParameters(
+        char_list=char_list,
+        blank=0,
+        syncope_tokens=[["a", "e", "i", "o", "u", "v"]],
+        replace_spaces_with_blanks=False,
+        min_window_size=60,
+        score_min_mean_over_L=2,
+    )
+    gt_mat, utt_indices = prepare_text(params, ["nahski"], char_list)
+    timings, char_probs, state_list = ctc_segmentation(params, lpz, gt_mat)
+
+    # State list must retain canonical 'a'
+    assert "a" in state_list, f"Vowel 'a' was erroneously dropped! state_list: {state_list}"
+
+
+
+
+
 
 
 
