@@ -22,6 +22,7 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                       np.ndarray[np.int64_t, ndim=2] ground_truth,
                       np.ndarray[np.int64_t, ndim=1] offsets,
                       np.ndarray[np.int8_t, ndim=1] is_syncope_token,
+                      np.ndarray[np.int64_t, ndim=1] syncope_token_gates,
                       np.ndarray[np.int64_t, ndim=1] intrusive_token_ids,
                       np.ndarray[np.int8_t, ndim=1] is_intrusive_site,
                       int intrusive_max_stride,
@@ -43,6 +44,8 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
         for blank-constrained syncope transitions (enforces the blank-only stride
         and non-acoustic blank rejection invariants so non-syncope characters/consonants
         are preserved).
+    :param syncope_token_gates: 1D mapping array of size vocab_size mapping token ID
+        to pooled gate token index (or identity for singletons/unmapped tokens).
     :param intrusive_token_ids: 1D array of token IDs eligible for intrusive insertion
     :param is_intrusive_site: 1D mask array gating allowed intrusive detour transition sites
     :param intrusive_max_stride: maximum blank frame stride for intrusive transitions
@@ -65,10 +68,13 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
     cdef float max_lpz_prob
     cdef float p, v_prob, p_cand, blank_sum, base_prob
     cdef int s, delta_offset, t_prev, j_idx, j, delta, b_t, t_detour, has_candidate, t_departure
-    cdef int anchor_tok, vowel_tok
+    cdef int anchor_tok, vowel_tok, gate_tok, prev_tok
     cdef int num_intrusive_tokens = intrusive_token_ids.shape[0]
     cdef int stay_transition_cost_zero
     cdef int preamble_transition_cost_zero
+
+    cdef int tau, interval_valid
+    cdef int tau_start, tau_end
 
     # Compute the mean offset between two window positions
     mean_offset = (lpz.shape[0] - table.shape[0]) / float(table.shape[1])
@@ -120,46 +126,110 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                             # Case A: c - 1 is a syncope token
                             if is_syncope_token[c - 1] == 1:
                                 vowel_tok = ground_truth[c - 1, 0]
-                                # Gate: acoustics at arrival frame must favor anchor over skipped vowel
-                                if lpz[t + offset_sum, anchor_tok] > lpz[t + offset_sum, vowel_tok]:
+                                gate_tok = syncope_token_gates[vowel_tok] if syncope_token_gates.shape[0] > vowel_tok else vowel_tok
+                                # Gate: acoustics at arrival frame must favor anchor over skipped vowel / vowel class
+                                if lpz[t + offset_sum, anchor_tok] > lpz[t + offset_sum, gate_tok]:
                                     # 1. Direct 1-token skip over syncope vowel (c - 2 -> c)
                                     delta_offset = offset_sum - offsets[c - 2]
                                     t_prev = t - 1 + delta_offset
                                     if 0 <= t_prev < table.shape[0]:
-                                        v_prob = table[t_prev, c - 2] + lpz[t + offset_sum, anchor_tok]
-                                        if v_prob > syncope_skip_prob:
-                                            syncope_skip_prob = v_prob
+                                        # Verify intermediate gap exhibits no vocalic peak
+                                        tau_start = (t_prev + 1 - delta_offset) + offset_sum
+                                        tau_end = t + offset_sum
+                                        interval_valid = 1
+                                        for tau in range(tau_start, tau_end):
+                                            if lpz[tau, gate_tok] > lpz[tau, blank]:
+                                                interval_valid = 0
+                                                break
+                                        if interval_valid:
+                                            # Check departure frame at t_prev
+                                            prev_tok = ground_truth[c - 2, 0]
+                                            t_departure = t_prev - delta_offset + offset_sum
+                                            if 0 <= t_departure < lpz.shape[0]:
+                                                if lpz[t_departure, gate_tok] > lpz[t_departure, blank]:
+                                                    if prev_tok != blank and prev_tok >= 0 and lpz[t_departure, gate_tok] > lpz[t_departure, prev_tok]:
+                                                        interval_valid = 0
+                                        if interval_valid:
+                                            v_prob = table[t_prev, c - 2] + lpz[t + offset_sum, anchor_tok]
+                                            if v_prob > syncope_skip_prob:
+                                                syncope_skip_prob = v_prob
 
                                     # 2. 2-token skip (c - 3 -> c) ONLY IF c - 2 is a blank/PAD
                                     if c >= 3 and (ground_truth[c - 2, 0] == blank or ground_truth[c - 2, 0] == -1):
                                         delta_offset = offset_sum - offsets[c - 3]
                                         t_prev = t - 1 + delta_offset
                                         if 0 <= t_prev < table.shape[0]:
-                                            v_prob = table[t_prev, c - 3] + lpz[t + offset_sum, anchor_tok]
-                                            if v_prob > syncope_skip_prob:
-                                                syncope_skip_prob = v_prob
+                                            tau_start = (t_prev + 1 - delta_offset) + offset_sum
+                                            tau_end = t + offset_sum
+                                            interval_valid = 1
+                                            for tau in range(tau_start, tau_end):
+                                                if lpz[tau, gate_tok] > lpz[tau, blank]:
+                                                    interval_valid = 0
+                                                    break
+                                            if interval_valid:
+                                                prev_tok = ground_truth[c - 3, 0]
+                                                t_departure = t_prev - delta_offset + offset_sum
+                                                if 0 <= t_departure < lpz.shape[0]:
+                                                    if lpz[t_departure, gate_tok] > lpz[t_departure, blank]:
+                                                        if prev_tok != blank and prev_tok >= 0 and lpz[t_departure, gate_tok] > lpz[t_departure, prev_tok]:
+                                                            interval_valid = 0
+                                            if interval_valid:
+                                                v_prob = table[t_prev, c - 3] + lpz[t + offset_sum, anchor_tok]
+                                                if v_prob > syncope_skip_prob:
+                                                    syncope_skip_prob = v_prob
 
                             # Case B: c - 2 is syncope token and c - 1 is a blank/space (inter-word syncope)
                             elif c >= 3 and is_syncope_token[c - 2] == 1 and (ground_truth[c - 1, 0] == blank or ground_truth[c - 1, 0] == -1):
                                 vowel_tok = ground_truth[c - 2, 0]
-                                # Gate: acoustics at arrival frame must favor anchor over skipped vowel
-                                if lpz[t + offset_sum, anchor_tok] > lpz[t + offset_sum, vowel_tok]:
+                                gate_tok = syncope_token_gates[vowel_tok] if syncope_token_gates.shape[0] > vowel_tok else vowel_tok
+                                # Gate: acoustics at arrival frame must favor anchor over skipped vowel / vowel class
+                                if lpz[t + offset_sum, anchor_tok] > lpz[t + offset_sum, gate_tok]:
                                     # 1. Skip vowel + trailing blank (c - 3 -> c)
                                     delta_offset = offset_sum - offsets[c - 3]
                                     t_prev = t - 1 + delta_offset
                                     if 0 <= t_prev < table.shape[0]:
-                                        v_prob = table[t_prev, c - 3] + lpz[t + offset_sum, anchor_tok]
-                                        if v_prob > syncope_skip_prob:
-                                            syncope_skip_prob = v_prob
+                                        tau_start = (t_prev + 1 - delta_offset) + offset_sum
+                                        tau_end = t + offset_sum
+                                        interval_valid = 1
+                                        for tau in range(tau_start, tau_end):
+                                            if lpz[tau, gate_tok] > lpz[tau, blank]:
+                                                interval_valid = 0
+                                                break
+                                        if interval_valid:
+                                            prev_tok = ground_truth[c - 3, 0]
+                                            t_departure = t_prev - delta_offset + offset_sum
+                                            if 0 <= t_departure < lpz.shape[0]:
+                                                if lpz[t_departure, gate_tok] > lpz[t_departure, blank]:
+                                                    if prev_tok != blank and prev_tok >= 0 and lpz[t_departure, gate_tok] > lpz[t_departure, prev_tok]:
+                                                        interval_valid = 0
+                                        if interval_valid:
+                                            v_prob = table[t_prev, c - 3] + lpz[t + offset_sum, anchor_tok]
+                                            if v_prob > syncope_skip_prob:
+                                                syncope_skip_prob = v_prob
 
                                     # 2. Skip leading blank + vowel + trailing blank (c - 4 -> c) ONLY IF c - 3 is blank
                                     if c >= 4 and (ground_truth[c - 3, 0] == blank or ground_truth[c - 3, 0] == -1):
                                         delta_offset = offset_sum - offsets[c - 4]
                                         t_prev = t - 1 + delta_offset
                                         if 0 <= t_prev < table.shape[0]:
-                                            v_prob = table[t_prev, c - 4] + lpz[t + offset_sum, anchor_tok]
-                                            if v_prob > syncope_skip_prob:
-                                                syncope_skip_prob = v_prob
+                                            tau_start = (t_prev + 1 - delta_offset) + offset_sum
+                                            tau_end = t + offset_sum
+                                            interval_valid = 1
+                                            for tau in range(tau_start, tau_end):
+                                                if lpz[tau, gate_tok] > lpz[tau, blank]:
+                                                    interval_valid = 0
+                                                    break
+                                            if interval_valid:
+                                                prev_tok = ground_truth[c - 4, 0]
+                                                t_departure = t_prev - delta_offset + offset_sum
+                                                if 0 <= t_departure < lpz.shape[0]:
+                                                    if lpz[t_departure, gate_tok] > lpz[t_departure, blank]:
+                                                        if prev_tok != blank and prev_tok >= 0 and lpz[t_departure, gate_tok] > lpz[t_departure, prev_tok]:
+                                                            interval_valid = 0
+                                            if interval_valid:
+                                                v_prob = table[t_prev, c - 4] + lpz[t + offset_sum, anchor_tok]
+                                                if v_prob > syncope_skip_prob:
+                                                    syncope_skip_prob = v_prob
 
             # Compute intrusive detour probability with blank-stride tolerance and relative contrastive gating
             intrusive_prob = prob_floor

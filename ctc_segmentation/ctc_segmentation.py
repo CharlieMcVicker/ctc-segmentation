@@ -63,7 +63,9 @@ class CtcSegmentationParameters:
         excluded_characters: String of punctuation characters excluded during text preparation.
         tokenized_meta_symbol: SentencePiece/BPE prefix symbol (default: "▁").
         char_list: Vocabulary list or mapping of character tokens (default: None).
-        syncope_tokens: Sequence of tokens (strings or integer IDs) that can be skipped via syncope (default: None).
+        syncope_tokens: Sequence of tokens (strings or integer IDs) or collections of tokens
+            (classes) that can be skipped via syncope (default: None). If a class (list, tuple, or set)
+            is provided, acoustic probability pooling via LogSumExp is used for contrastive syncope gating.
         is_syncope_token: Optional sequence or 1D mask marking syncope token positions in ground truth for
             blank-constrained syncope transitions (default: None). Enforces the Consonant Preservation Invariant
             and Blank-Only Stride Invariants (Case A and Case B).
@@ -92,7 +94,7 @@ class CtcSegmentationParameters:
     excluded_characters: str = ".,»«•❍·"
     tokenized_meta_symbol: str = "▁"
     char_list: Optional[Union[List[str], Tuple[str, ...], Set[str], Sequence[str]]] = None
-    syncope_tokens: Optional[Sequence[Union[str, int]]] = None
+    syncope_tokens: Optional[Sequence[Union[str, int, Sequence[Union[str, int]], Set[Union[str, int]]]]] = None
     is_syncope_token: Optional[Union[Sequence[Union[bool, int]], np.ndarray]] = None
     # Intrusive Token Subsystem
     intrusive_tokens: Optional[Sequence[Union[str, int]]] = None
@@ -362,6 +364,90 @@ def _get_intrusive_token_ids(
     return np.zeros(0, dtype=np.int64)
 
 
+def _logsumexp(a: np.ndarray, axis: int = -1) -> np.ndarray:
+    """Numerically stable logsumexp implementation with scipy fallback."""
+    try:
+        from scipy.special import logsumexp
+        return logsumexp(a, axis=axis)
+    except ImportError:
+        max_val = np.max(a, axis=axis, keepdims=True)
+        # Handle -inf values safely
+        with np.errstate(under="ignore", divide="ignore"):
+            sum_exp = np.sum(np.exp(a - max_val), axis=axis, keepdims=True)
+            out = np.log(sum_exp) + max_val
+        return np.squeeze(out, axis=axis)
+
+
+def _parse_syncope_classes(
+    config: CtcSegmentationParameters,
+) -> Tuple[List[int], List[List[int]]]:
+    """Parse syncope_tokens into (all_syncope_token_ids, multi_token_classes).
+
+    Returns:
+        all_token_ids: List of integer vocabulary token IDs marked as syncope tokens.
+        multi_token_classes: List of lists of integer token IDs for classes with length > 1.
+
+    Raises:
+        ValueError: If a token appears in multiple classes (overlapping classes) or
+            token string is not found in char_list.
+        TypeError: If token type is invalid.
+    """
+    raw_syncope = config.syncope_tokens
+    if raw_syncope is None:
+        return [], []
+
+    char_list = list(config.char_list) if config.char_list is not None else None
+
+    def resolve_token(item: Any) -> int:
+        if isinstance(item, str):
+            if char_list is not None and item in char_list:
+                return char_list.index(item)
+            else:
+                raise ValueError(f"Syncope token '{item}' not found in char_list")
+        elif isinstance(item, (int, np.integer)) and not isinstance(item, bool):
+            tok_id = int(item)
+            if char_list is not None and not (0 <= tok_id < len(char_list)):
+                raise ValueError(
+                    f"Syncope token id {tok_id} out of range for char_list of length {len(char_list)}"
+                )
+            if tok_id < 0:
+                raise ValueError(f"Syncope token id must be non-negative, got {tok_id}")
+            return tok_id
+        else:
+            raise TypeError(f"Unsupported syncope token element type: {type(item).__name__}")
+
+    all_token_ids: List[int] = []
+    multi_token_classes: List[List[int]] = []
+    seen_tokens: Set[int] = set()
+
+    for item in raw_syncope:
+        if isinstance(item, (list, tuple, set)):
+            class_ids = [resolve_token(elem) for elem in item]
+            if len(class_ids) == 0:
+                continue
+            for tok_id in class_ids:
+                if tok_id in seen_tokens:
+                    tok_name = char_list[tok_id] if char_list is not None else str(tok_id)
+                    raise ValueError(
+                        f"Syncope token '{tok_name}' (ID: {tok_id}) appears in multiple classes or definitions"
+                    )
+                seen_tokens.add(tok_id)
+                all_token_ids.append(tok_id)
+            if len(class_ids) > 1:
+                multi_token_classes.append(class_ids)
+        else:
+            tok_id = resolve_token(item)
+            if tok_id in seen_tokens:
+                tok_name = char_list[tok_id] if char_list is not None else str(tok_id)
+                raise ValueError(
+                    f"Syncope token '{tok_name}' (ID: {tok_id}) appears in multiple classes or definitions"
+                )
+            seen_tokens.add(tok_id)
+            all_token_ids.append(tok_id)
+
+    return all_token_ids, multi_token_classes
+
+
 def _create_syncope_mask(
     config: CtcSegmentationParameters,
     ground_truth: Union[Sequence[Any], np.ndarray],
@@ -369,25 +455,16 @@ def _create_syncope_mask(
 ) -> np.ndarray:
     """Create a 1D int8 mask indicating syncope token positions in ground_truth."""
     mask = np.zeros(len(ground_truth), dtype=np.int8)
-    tokens = config.syncope_tokens
-    if tokens is None:
+    if config.syncope_tokens is None:
         return mask
-    syncope_set = set(tokens)
+    syncope_ids, _ = _parse_syncope_classes(config)
+    syncope_set = set(syncope_ids)
     for idx, item in enumerate(ground_truth):
         if is_token_ids:
             if item in syncope_set:
                 mask[idx] = 1
-            elif (
-                config.char_list is not None
-                and isinstance(item, (int, np.integer))
-                and 0 <= item < len(config.char_list)
-                and config.char_list[item] in syncope_set
-            ):
-                mask[idx] = 1
         else:
-            if item in syncope_set:
-                mask[idx] = 1
-            elif (
+            if (
                 config.char_list is not None
                 and item in config.char_list
                 and config.char_list.index(item) in syncope_set
@@ -423,6 +500,8 @@ class TrellisRuntimeContext:
     Attributes:
         is_syncope_token: 1D `int8` array of shape `(L,)` indicating which ground-truth
             states are eligible for blank-constrained syncope skip transitions.
+        syncope_token_gates: 1D `int64` array of shape `(vocab_size,)` mapping token IDs
+            to pooled gating indices in `lpz` (or identity for singletons/unmapped tokens).
         intrusive_token_ids: 1D `int64` array of shape `(K,)` with vocabulary token IDs
             of eligible intrusive detour tokens.
         is_intrusive_site: 1D `int8` array of shape `(L,)` (or empty if unrestricted)
@@ -434,6 +513,7 @@ class TrellisRuntimeContext:
 
     # Ground truth & syncope arrays
     is_syncope_token: np.ndarray  # 1D np.int8 array of shape (L,)
+    syncope_token_gates: np.ndarray  # 1D np.int64 array of shape (vocab_size,)
 
     # Intrusive detour arrays
     intrusive_token_ids: np.ndarray  # 1D np.int64 array of shape (K,)
@@ -448,6 +528,7 @@ class TrellisRuntimeContext:
         cls,
         config: CtcSegmentationParameters,
         ground_truth: np.ndarray,
+        vocab_size: Optional[int] = None,
         is_syncope_token: Optional[Union[Sequence[Union[bool, int]], np.ndarray]] = None,
     ) -> "TrellisRuntimeContext":
         """Compile and validate user configuration into C-contiguous NumPy runtime arrays.
@@ -459,6 +540,8 @@ class TrellisRuntimeContext:
         Args:
             config: An instance of `CtcSegmentationParameters`.
             ground_truth: 2D label matrix of shape `(L, max_char_len)`.
+            vocab_size: Optional number of vocabulary tokens (columns in lpz). If not
+                provided, deduced from char_list or ground_truth.
             is_syncope_token: Optional sequence or 1D mask override for syncope tokens.
 
         Returns:
@@ -470,8 +553,16 @@ class TrellisRuntimeContext:
             TypeError: If configuration parameters have invalid types.
         """
         num_cols = ground_truth.shape[0]
+        if vocab_size is None:
+            if config.char_list is not None:
+                v_size = len(config.char_list)
+            else:
+                max_gt = int(np.max(ground_truth)) if ground_truth.size > 0 else 0
+                v_size = max(max_gt + 1, 1)
+        else:
+            v_size = int(vocab_size)
 
-        # 1. Compile syncope mask
+        # 1. Compile syncope mask and syncope token gates
         syncope_input = (
             is_syncope_token if is_syncope_token is not None else config.is_syncope_token
         )
@@ -484,6 +575,14 @@ class TrellisRuntimeContext:
                 )
         else:
             syncope_mask = np.zeros((0,), dtype=np.int8)
+
+        _, multi_classes = _parse_syncope_classes(config)
+        syncope_token_gates = np.arange(v_size, dtype=np.int64)
+        for class_idx, class_tokens in enumerate(multi_classes):
+            pooled_idx = v_size + class_idx
+            for tok_id in class_tokens:
+                if tok_id < v_size:
+                    syncope_token_gates[tok_id] = pooled_idx
 
         # 2. Compile intrusive token IDs
         intrusive_token_ids = np.ascontiguousarray(
@@ -503,6 +602,7 @@ class TrellisRuntimeContext:
 
         return cls(
             is_syncope_token=syncope_mask,
+            syncope_token_gates=np.ascontiguousarray(syncope_token_gates, dtype=np.int64),
             intrusive_token_ids=intrusive_token_ids,
             is_intrusive_site=site_mask,
             intrusive_max_stride=int(config.intrusive_max_stride),
@@ -569,9 +669,28 @@ def ctc_segmentation(
     if len(ground_truth) > lpz.shape[0] and config.skip_prob <= config.max_prob:
         raise AssertionError("Audio is shorter than text!")
 
+    orig_vocab_size = lpz.shape[1]
     runtime_ctx = TrellisRuntimeContext.compile(
-        config, ground_truth, is_syncope_token=is_syncope_token
+        config, ground_truth, vocab_size=orig_vocab_size, is_syncope_token=is_syncope_token
     )
+
+    # Compute pooled rows for multi-token syncope classes if configured
+    _, multi_classes = _parse_syncope_classes(config)
+    if len(multi_classes) > 0:
+        pooled_rows = []
+        for class_tokens in multi_classes:
+            valid_tokens = [tok for tok in class_tokens if tok < orig_vocab_size]
+            if len(valid_tokens) > 0:
+                class_lpz = lpz[:, valid_tokens]
+                pooled_row = _logsumexp(class_lpz, axis=1)  # shape (time_frames,)
+            else:
+                pooled_row = np.full((lpz.shape[0],), -np.inf, dtype=lpz.dtype)
+            pooled_rows.append(pooled_row[:, np.newaxis])
+        lpz_extended = np.ascontiguousarray(
+            np.hstack([lpz] + pooled_rows), dtype=np.float32
+        )
+    else:
+        lpz_extended = np.ascontiguousarray(lpz, dtype=np.float32)
 
     window_size = config.min_window_size
     # Try multiple window lengths if it fails
@@ -586,10 +705,11 @@ def ctc_segmentation(
         # Run actual alignment of utterances
         t, c = cython_fill_table(
             table,
-            lpz.astype(np.float32),
+            lpz_extended,
             np.array(ground_truth, dtype=np.int64),
             offsets,
             runtime_ctx.is_syncope_token,
+            runtime_ctx.syncope_token_gates,
             runtime_ctx.intrusive_token_ids,
             runtime_ctx.is_intrusive_site,
             runtime_ctx.intrusive_max_stride,
@@ -646,7 +766,12 @@ def ctc_segmentation(
                             if anchor_tok != blank:
                                 if runtime_ctx.is_syncope_token[c - 1] == 1:
                                     vowel_tok = ground_truth[c - 1, 0]
-                                    if lpz[t + offsets[c], anchor_tok] > lpz[t + offsets[c], vowel_tok]:
+                                    gate_tok = (
+                                        runtime_ctx.syncope_token_gates[vowel_tok]
+                                        if vowel_tok < len(runtime_ctx.syncope_token_gates)
+                                        else vowel_tok
+                                    )
+                                    if lpz_extended[t + offsets[c], anchor_tok] > lpz_extended[t + offsets[c], gate_tok]:
                                         candidates.append(c - 2)
                                         if c >= 3 and (ground_truth[c - 2, 0] == blank or ground_truth[c - 2, 0] == -1):
                                             candidates.append(c - 3)
@@ -659,7 +784,12 @@ def ctc_segmentation(
                                     )
                                 ):
                                     vowel_tok = ground_truth[c - 2, 0]
-                                    if lpz[t + offsets[c], anchor_tok] > lpz[t + offsets[c], vowel_tok]:
+                                    gate_tok = (
+                                        runtime_ctx.syncope_token_gates[vowel_tok]
+                                        if vowel_tok < len(runtime_ctx.syncope_token_gates)
+                                        else vowel_tok
+                                    )
+                                    if lpz_extended[t + offsets[c], anchor_tok] > lpz_extended[t + offsets[c], gate_tok]:
                                         candidates.append(c - 3)
                                         if c >= 4 and (ground_truth[c - 3, 0] == blank or ground_truth[c - 3, 0] == -1):
                                             candidates.append(c - 4)
@@ -668,6 +798,16 @@ def ctc_segmentation(
                                 delta_offset = offsets[c] - offsets[c_prev]
                                 t_prev = t - 1 + delta_offset
                                 if 0 <= t_prev < table.shape[0]:
+                                    tau_start = (t_prev + 1 - delta_offset) + offsets[c]
+                                    tau_end = t + offsets[c]
+                                    if np.any(lpz_extended[tau_start:tau_end, gate_tok] > lpz_extended[tau_start:tau_end, blank]):
+                                        continue
+                                    prev_tok = ground_truth[c_prev, 0]
+                                    t_departure = t_prev - delta_offset + offsets[c]
+                                    if 0 <= t_departure < lpz_extended.shape[0]:
+                                        if lpz_extended[t_departure, gate_tok] > lpz_extended[t_departure, blank]:
+                                            if prev_tok != blank and prev_tok >= 0 and lpz_extended[t_departure, gate_tok] > lpz_extended[t_departure, prev_tok]:
+                                                continue
                                     est_v_prob = table[t, c] - table[t_prev, c_prev]
                                     expected_v_prob = lpz[t + offsets[c], anchor_tok]
                                     v_delta = abs(est_v_prob - expected_v_prob)
