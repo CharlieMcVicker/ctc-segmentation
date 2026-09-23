@@ -14,13 +14,13 @@ ext = '.pyx' if USE_CYTHON else '.c'
 extensions = [
     Extension(
         name="ctc_segmentation.ctc_segmentation_dyn",
-        sources=["ctc_segmentation/ctc_segmentation_dyn"+ext],
+        sources=["ctc_segmentation/ctc_segmentation_dyn" + ext],
         include_dirs=[numpy.get_include()],
+        define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
     )
 ]
 if USE_CYTHON:
-    from Cython.Build import cythonize
-    extensions = cythonize(extensions)
+    extensions = cythonize(extensions, force=True)
 
 package_information = """
 # CTC segmentation
@@ -38,9 +38,10 @@ setup(
 
     python_requires='>=3.6',
     packages=find_packages(exclude=["tests"]),
-    setup_requires=["numpy"],
-    install_requires=["setuptools", "numpy", "Cython"],
-    tests_require=["pytest", "torch"],
+    install_requires=["numpy"],
+    extras_require={
+        "test": ["pytest", "torch"],
+    },
     zip_safe=False,
     ext_modules=extensions,
     cmdclass={'build_ext': build_ext},
