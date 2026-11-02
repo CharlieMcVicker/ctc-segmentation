@@ -134,21 +134,19 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                                     t_prev = t - 1 + delta_offset
                                     if 0 <= t_prev < table.shape[0]:
                                         # Verify intermediate gap exhibits no vocalic peak
-                                        tau_start = (t_prev + 1 - delta_offset) + offset_sum
+                                        prev_tok = ground_truth[c - 2, 0]
                                         tau_end = t + offset_sum
                                         interval_valid = 1
-                                        for tau in range(tau_start, tau_end):
+                                        for tau in range(tau_end - 1, offsets[c - 2] - 1, -1):
+                                            if tau < 0:
+                                                break
+                                            if prev_tok != blank and prev_tok >= 0 and lpz[tau, prev_tok] > lpz[tau, blank]:
+                                                if lpz[tau, gate_tok] > lpz[tau, blank] and lpz[tau, gate_tok] > lpz[tau, prev_tok]:
+                                                    interval_valid = 0
+                                                break
                                             if lpz[tau, gate_tok] > lpz[tau, blank]:
                                                 interval_valid = 0
                                                 break
-                                        if interval_valid:
-                                            # Check departure frame at t_prev
-                                            prev_tok = ground_truth[c - 2, 0]
-                                            t_departure = t_prev - delta_offset + offset_sum
-                                            if 0 <= t_departure < lpz.shape[0]:
-                                                if lpz[t_departure, gate_tok] > lpz[t_departure, blank]:
-                                                    if prev_tok != blank and prev_tok >= 0 and lpz[t_departure, gate_tok] > lpz[t_departure, prev_tok]:
-                                                        interval_valid = 0
                                         if interval_valid:
                                             v_prob = table[t_prev, c - 2] + lpz[t + offset_sum, anchor_tok]
                                             if v_prob > syncope_skip_prob:
@@ -159,20 +157,19 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                                         delta_offset = offset_sum - offsets[c - 3]
                                         t_prev = t - 1 + delta_offset
                                         if 0 <= t_prev < table.shape[0]:
-                                            tau_start = (t_prev + 1 - delta_offset) + offset_sum
+                                            prev_tok = ground_truth[c - 3, 0]
                                             tau_end = t + offset_sum
                                             interval_valid = 1
-                                            for tau in range(tau_start, tau_end):
+                                            for tau in range(tau_end - 1, offsets[c - 3] - 1, -1):
+                                                if tau < 0:
+                                                    break
+                                                if prev_tok != blank and prev_tok >= 0 and lpz[tau, prev_tok] > lpz[tau, blank]:
+                                                    if lpz[tau, gate_tok] > lpz[tau, blank] and lpz[tau, gate_tok] > lpz[tau, prev_tok]:
+                                                        interval_valid = 0
+                                                    break
                                                 if lpz[tau, gate_tok] > lpz[tau, blank]:
                                                     interval_valid = 0
                                                     break
-                                            if interval_valid:
-                                                prev_tok = ground_truth[c - 3, 0]
-                                                t_departure = t_prev - delta_offset + offset_sum
-                                                if 0 <= t_departure < lpz.shape[0]:
-                                                    if lpz[t_departure, gate_tok] > lpz[t_departure, blank]:
-                                                        if prev_tok != blank and prev_tok >= 0 and lpz[t_departure, gate_tok] > lpz[t_departure, prev_tok]:
-                                                            interval_valid = 0
                                             if interval_valid:
                                                 v_prob = table[t_prev, c - 3] + lpz[t + offset_sum, anchor_tok]
                                                 if v_prob > syncope_skip_prob:
@@ -188,20 +185,19 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                                     delta_offset = offset_sum - offsets[c - 3]
                                     t_prev = t - 1 + delta_offset
                                     if 0 <= t_prev < table.shape[0]:
-                                        tau_start = (t_prev + 1 - delta_offset) + offset_sum
+                                        prev_tok = ground_truth[c - 3, 0]
                                         tau_end = t + offset_sum
                                         interval_valid = 1
-                                        for tau in range(tau_start, tau_end):
+                                        for tau in range(tau_end - 1, offsets[c - 3] - 1, -1):
+                                            if tau < 0:
+                                                break
+                                            if prev_tok != blank and prev_tok >= 0 and lpz[tau, prev_tok] > lpz[tau, blank]:
+                                                if lpz[tau, gate_tok] > lpz[tau, blank] and lpz[tau, gate_tok] > lpz[tau, prev_tok]:
+                                                    interval_valid = 0
+                                                break
                                             if lpz[tau, gate_tok] > lpz[tau, blank]:
                                                 interval_valid = 0
                                                 break
-                                        if interval_valid:
-                                            prev_tok = ground_truth[c - 3, 0]
-                                            t_departure = t_prev - delta_offset + offset_sum
-                                            if 0 <= t_departure < lpz.shape[0]:
-                                                if lpz[t_departure, gate_tok] > lpz[t_departure, blank]:
-                                                    if prev_tok != blank and prev_tok >= 0 and lpz[t_departure, gate_tok] > lpz[t_departure, prev_tok]:
-                                                        interval_valid = 0
                                         if interval_valid:
                                             v_prob = table[t_prev, c - 3] + lpz[t + offset_sum, anchor_tok]
                                             if v_prob > syncope_skip_prob:
@@ -212,20 +208,19 @@ def cython_fill_table(np.ndarray[np.float32_t, ndim=2] table,
                                         delta_offset = offset_sum - offsets[c - 4]
                                         t_prev = t - 1 + delta_offset
                                         if 0 <= t_prev < table.shape[0]:
-                                            tau_start = (t_prev + 1 - delta_offset) + offset_sum
+                                            prev_tok = ground_truth[c - 4, 0]
                                             tau_end = t + offset_sum
                                             interval_valid = 1
-                                            for tau in range(tau_start, tau_end):
+                                            for tau in range(tau_end - 1, offsets[c - 4] - 1, -1):
+                                                if tau < 0:
+                                                    break
+                                                if prev_tok != blank and prev_tok >= 0 and lpz[tau, prev_tok] > lpz[tau, blank]:
+                                                    if lpz[tau, gate_tok] > lpz[tau, blank] and lpz[tau, gate_tok] > lpz[tau, prev_tok]:
+                                                        interval_valid = 0
+                                                    break
                                                 if lpz[tau, gate_tok] > lpz[tau, blank]:
                                                     interval_valid = 0
                                                     break
-                                            if interval_valid:
-                                                prev_tok = ground_truth[c - 4, 0]
-                                                t_departure = t_prev - delta_offset + offset_sum
-                                                if 0 <= t_departure < lpz.shape[0]:
-                                                    if lpz[t_departure, gate_tok] > lpz[t_departure, blank]:
-                                                        if prev_tok != blank and prev_tok >= 0 and lpz[t_departure, gate_tok] > lpz[t_departure, prev_tok]:
-                                                            interval_valid = 0
                                             if interval_valid:
                                                 v_prob = table[t_prev, c - 4] + lpz[t + offset_sum, anchor_tok]
                                                 if v_prob > syncope_skip_prob:

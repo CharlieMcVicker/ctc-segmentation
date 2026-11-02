@@ -5,6 +5,7 @@
 
 import csv
 import os
+from pathlib import Path
 import time
 import numpy as np
 import pytest
@@ -741,10 +742,25 @@ def test_syncope_interval_peak_scanning_nahski():
     assert "a" in state_list, f"Vowel 'a' was erroneously dropped! state_list: {state_list}"
 
 
+def test_syncope_real_acoustic_nahski_nvhski():
+    """Test 19: Real acoustic emissions of 'nahski' spoken with dialectal /v/ ('nvhski') retains 'a'."""
+    data_path = Path(__file__).parent / "data_nahski_real_lpz.npz"
+    data = np.load(data_path)
+    lpz = data["lpz"]
+    char_list = list(data["char_list"])
+    blank_idx = char_list.index("[PAD]")
 
+    params = CtcSegmentationParameters(
+        char_list=char_list,
+        blank=blank_idx,
+        syncope_tokens=[["a", "e", "i", "o", "u", "v"], "t"],
+        replace_spaces_with_blanks=False,
+        min_window_size=10,
+        score_min_mean_over_L=2,
+    )
 
+    gt_mat, utt_indices = prepare_text(params, ["nahski"], char_list)
+    timings, char_probs, state_list = ctc_segmentation(params, lpz, gt_mat)
 
-
-
-
-
+    # Vowel 'a' must be retained due to the strong acoustic /v/ frames (at frame 5 / 493.50s)
+    assert "a" in state_list, f"Expected canonical 'a' to be retained under vocalic class pooling, but got: {state_list}"
